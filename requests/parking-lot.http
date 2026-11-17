@@ -1,0 +1,81 @@
+# VS Code REST Client: click "Send Request" on each block, top to bottom.
+# Fees: ₹20 bike / ₹50 car / ₹100 truck per started hour, first hour minimum.
+# (A live demo always shows the 1-hour fee; the 61-min / 3-h cases are in the unit tests with FakeClock.)
+@base = http://localhost:3000
+
+### 1. Lot with 2 floors: ground has 1 bike + 1 car slot, first floor has 1 car + 1 truck
+# @name lot
+POST {{base}}/parking-lots
+Content-Type: application/json
+
+{ "name": "HQ", "floors": [ { "bike": 1, "car": 1 }, { "car": 1, "truck": 1 } ] }
+
+### 2. Availability per floor
+GET {{base}}/parking-lots/{{lot.response.body.data.id}}/availability
+
+### 3. Park a car → 201, slot F0-C1 (nearest first)
+# @name car1
+POST {{base}}/parking-lots/{{lot.response.body.data.id}}/park
+Content-Type: application/json
+
+{ "vehicleNumber": "KA01AB1234", "vehicleType": "CAR" }
+
+### 4. Second car → F1-C1 (next floor)
+POST {{base}}/parking-lots/{{lot.response.body.data.id}}/park
+Content-Type: application/json
+
+{ "vehicleNumber": "KA01AB5678", "vehicleType": "CAR" }
+
+### 5. Third car → 409 "No CAR slot available"
+POST {{base}}/parking-lots/{{lot.response.body.data.id}}/park
+Content-Type: application/json
+
+{ "vehicleNumber": "KA01AB9999", "vehicleType": "CAR" }
+
+### 6. Same car again, typed differently → 409 "already parked" (number is normalised)
+POST {{base}}/parking-lots/{{lot.response.body.data.id}}/park
+Content-Type: application/json
+
+{ "vehicleNumber": "ka-01 ab 1234", "vehicleType": "CAR" }
+
+### 7. Bike → F0-B1
+POST {{base}}/parking-lots/{{lot.response.body.data.id}}/park
+Content-Type: application/json
+
+{ "vehicleNumber": "KA05XY0001", "vehicleType": "BIKE" }
+
+### 8. Second bike → 409: no bike slot, and both car slots are taken (it checked CAR too)
+POST {{base}}/parking-lots/{{lot.response.body.data.id}}/park
+Content-Type: application/json
+
+{ "vehicleNumber": "KA05XY0002", "vehicleType": "BIKE" }
+
+### 9. Availability now: only the truck slot is free
+GET {{base}}/parking-lots/{{lot.response.body.data.id}}/availability
+
+### 10. Unpark car 1 → 200 { fee: 50, durationMinutes, billableHours: 1, ticket: PAID }
+POST {{base}}/parking-lots/{{lot.response.body.data.id}}/unpark
+Content-Type: application/json
+
+{ "ticketId": "{{car1.response.body.data.id}}" }
+
+### 11. Unpark again → 409 "already paid"
+POST {{base}}/parking-lots/{{lot.response.body.data.id}}/unpark
+Content-Type: application/json
+
+{ "ticketId": "{{car1.response.body.data.id}}" }
+
+### 12. The second bike now fits... in the freed CAR slot F0-C1
+POST {{base}}/parking-lots/{{lot.response.body.data.id}}/park
+Content-Type: application/json
+
+{ "vehicleNumber": "KA05XY0002", "vehicleType": "BIKE" }
+
+### 13. The closed ticket
+GET {{base}}/tickets/{{car1.response.body.data.id}}
+
+### 14. Bad layout → 400 with nested paths (floors.0.car ...)
+POST {{base}}/parking-lots
+Content-Type: application/json
+
+{ "name": "", "floors": [ { "car": -1, "boat": 2 } ] }

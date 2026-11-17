@@ -1,0 +1,62 @@
+@base = http://localhost:3000
+
+### Members
+# @name asha
+POST {{base}}/splitwise/members
+Content-Type: application/json
+
+{ "name": "Asha", "email": "asha@x.com" }
+
+###
+# @name ravi
+POST {{base}}/splitwise/members
+Content-Type: application/json
+
+{ "name": "Ravi", "email": "ravi@x.com" }
+
+###
+# @name meera
+POST {{base}}/splitwise/members
+Content-Type: application/json
+
+{ "name": "Meera", "email": "meera@x.com" }
+
+### Group
+# @name group
+POST {{base}}/splitwise/groups
+Content-Type: application/json
+
+{ "name": "Goa trip", "memberIds": ["{{asha.response.body.data.id}}", "{{ravi.response.body.data.id}}", "{{meera.response.body.data.id}}"] }
+
+### EQUAL: Asha pays ₹1000 for all three -> 33334 / 33333 / 33333
+POST {{base}}/splitwise/groups/{{group.response.body.data.id}}/expenses
+Content-Type: application/json
+
+{ "description": "Hotel", "paidBy": "{{asha.response.body.data.id}}", "amountPaise": 100000, "splitType": "EQUAL",
+  "splits": [{ "memberId": "{{asha.response.body.data.id}}" }, { "memberId": "{{ravi.response.body.data.id}}" }, { "memberId": "{{meera.response.body.data.id}}" }] }
+
+### PERCENT: Ravi pays ₹600, 50/30/20
+POST {{base}}/splitwise/groups/{{group.response.body.data.id}}/expenses
+Content-Type: application/json
+
+{ "description": "Scuba", "paidBy": "{{ravi.response.body.data.id}}", "amountPaise": 60000, "splitType": "PERCENT",
+  "splits": [{ "memberId": "{{asha.response.body.data.id}}", "value": 50 }, { "memberId": "{{ravi.response.body.data.id}}", "value": 30 }, { "memberId": "{{meera.response.body.data.id}}", "value": 20 }] }
+
+### EXACT not adding up -> 400
+POST {{base}}/splitwise/groups/{{group.response.body.data.id}}/expenses
+Content-Type: application/json
+
+{ "description": "Cab", "paidBy": "{{meera.response.body.data.id}}", "amountPaise": 30000, "splitType": "EXACT",
+  "splits": [{ "memberId": "{{asha.response.body.data.id}}", "value": 10000 }, { "memberId": "{{ravi.response.body.data.id}}", "value": 10000 }] }
+
+### Balances: net, pairwise, simplified
+GET {{base}}/splitwise/groups/{{group.response.body.data.id}}/balances
+
+### Settle (more than owed -> 422)
+POST {{base}}/splitwise/groups/{{group.response.body.data.id}}/settlements
+Content-Type: application/json
+
+{ "from": "{{meera.response.body.data.id}}", "to": "{{asha.response.body.data.id}}", "amountPaise": 10000 }
+
+### Member across groups
+GET {{base}}/splitwise/members/{{meera.response.body.data.id}}/summary

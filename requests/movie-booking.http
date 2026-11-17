@@ -1,0 +1,82 @@
+@base = http://localhost:3000
+
+### 1. Cinema with one screen: rows A-B regular, C recliner
+# @name cinema
+POST {{base}}/cinemas
+Content-Type: application/json
+
+{ "name": "PVR Forum", "city": "Bengaluru", "screens": [
+  { "name": "Audi 1", "rows": [
+    { "row": "A", "seats": 6, "type": "REGULAR" },
+    { "row": "B", "seats": 6, "type": "REGULAR" },
+    { "row": "C", "seats": 4, "type": "RECLINER" }
+  ] }
+] }
+
+### 2. Movie
+# @name movie
+POST {{base}}/movies
+Content-Type: application/json
+
+{ "title": "Interstellar", "durationMin": 169, "language": "English" }
+
+### 3. Show (pick a future time; Fri-Sun shows are +10%)
+# @name show
+POST {{base}}/shows
+Content-Type: application/json
+
+{ "movieId": "{{movie.response.body.data.id}}", "screenId": "{{cinema.response.body.data.screens[0].id}}",
+  "startsAt": "2026-12-01T12:30:00Z", "prices": { "REGULAR": 20000, "RECLINER": 50000 } }
+
+### 4. Same screen, overlapping time (incl. 20 min cleaning) -> 409
+POST {{base}}/shows
+Content-Type: application/json
+
+{ "movieId": "{{movie.response.body.data.id}}", "screenId": "{{cinema.response.body.data.screens[0].id}}",
+  "startsAt": "2026-12-01T14:00:00Z", "prices": { "REGULAR": 20000, "RECLINER": 50000 } }
+
+### 5. Shows in a city
+GET {{base}}/shows?city=bengaluru
+
+### 6. Seat map
+GET {{base}}/shows/{{show.response.body.data.id}}/seats
+
+### 7. Hold seats (5 min) -> 201 HELD with price quote
+# @name hold
+POST {{base}}/shows/{{show.response.body.data.id}}/bookings
+Content-Type: application/json
+
+{ "userId": "u1", "seats": ["C1", "C2"] }
+
+### 8. Another user wants C2 -> 409 { taken: ["C2"] } (all-or-nothing)
+POST {{base}}/shows/{{show.response.body.data.id}}/bookings
+Content-Type: application/json
+
+{ "userId": "u2", "seats": ["C2", "C3"] }
+
+### 9. Declined card -> 422, booking back to HELD (retry before the hold ends)
+POST {{base}}/bookings/{{hold.response.body.data.id}}/confirm
+Content-Type: application/json
+
+{ "userId": "u1", "paymentToken": "tok_decline" }
+
+### 10. Confirm -> 200 CONFIRMED
+POST {{base}}/bookings/{{hold.response.body.data.id}}/confirm
+Content-Type: application/json
+
+{ "userId": "u1", "paymentToken": "tok_ok" }
+
+### 11. Confirm again -> 409
+POST {{base}}/bookings/{{hold.response.body.data.id}}/confirm
+Content-Type: application/json
+
+{ "userId": "u1", "paymentToken": "tok_ok" }
+
+### 12. Cancel (more than 2h before the show) -> refund, seats free
+POST {{base}}/bookings/{{hold.response.body.data.id}}/cancel
+Content-Type: application/json
+
+{ "userId": "u1" }
+
+### 13. Booking with history
+GET {{base}}/bookings/{{hold.response.body.data.id}}

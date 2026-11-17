@@ -1,0 +1,152 @@
+  <div class="part-banner" id="lf-hld"><p class="eyebrow">Part B · System design (HLD)</p><p class="part-title">A centralised logging platform</p><p>The LLD is the library inside each service. The HLD question is what happens next: collecting logs from 20,000 pods, making them searchable within seconds, keeping them affordably for months, and never letting logging take an application down.</p></div>
+
+  <h2 id="lf-h1">H1. Functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>In scope</th><th>Out of scope</th></tr></thead>
+    <tbody><tr><td><ul>
+      <li>A client library (the LLD) and collection from every host and container</li>
+      <li>Search by time range, service, level, any structured field, trace id, and free text</li>
+      <li>Live tail with a filter</li>
+      <li>Alerts on log patterns and rates ("&gt; 50 ERROR/min from checkout")</li>
+      <li>Multi-tenant: per-team quotas, retention and access control</li>
+      <li>PII redaction before storage; retention tiers and archive</li>
+    </ul></td><td><ul>
+      <li>Metrics and traces (related pipelines, mentioned in Q3)</li>
+      <li>Full SIEM and security analytics</li>
+      <li>Dashboards beyond simple counts over time</li>
+    </ul></td></tr></tbody>
+  </table></div>
+
+  <h2 id="lf-h2">H2. Non-functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quality</th><th>Target</th><th>Why, and what it forces</th></tr></thead>
+    <tbody>
+      <tr><td>Never hurt the app</td><td>0 requests blocked by logging</td><td>Bounded, non-blocking buffers in the library and agent. Drop and count, never wait.</td></tr>
+      <tr><td>Ingest availability</td><td>99.9%</td><td>Agents buffer to disk, so ingest can be down for minutes without losing data.</td></tr>
+      <tr><td>Freshness</td><td>Searchable within 30 s, p99</td><td>Short batches all the way through. Live tail reads straight from Kafka.</td></tr>
+      <tr><td>Query latency</td><td>p95 &lt; 3 s over the last 24 h for one service</td><td>Filter on labels first, then scan in parallel.</td></tr>
+      <tr><td>Delivery</td><td>At least once; loss only under declared overload</td><td>Duplicates are tolerable, deduplicated on read by event id. Silent loss is not: every drop is counted.</td></tr>
+      <tr><td>Cost</td><td>Under ~$0.10 per GB ingested, all-in</td><td>Compression, cheap object storage, indexing only what you query by.</td></tr>
+      <tr><td>Security</td><td>No secrets or PII at rest</td><td>Redaction in the library and again in the pipeline. RBAC per tenant. Every query audited.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="lf-h3">H3. Capacity estimation</h2>
+  <p>Assumptions: 2,000 services, 20k pods, 50 lines per second per pod on average, 500 bytes per line, peak 3× average, compression around 10×.</p>
+  <div class="table-wrap"><table class="calc">
+    <thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Lines</td><td>20k × 50</td><td class="num">1M/s average, 3M/s peak</td></tr>
+      <tr><td>Ingest bandwidth</td><td>1M × 500 B</td><td class="num">500 MB/s average (1.5 GB/s peak)</td></tr>
+      <tr><td>Raw volume</td><td>500 MB/s × 86,400</td><td class="num">~43 TB/day</td></tr>
+      <tr><td>Stored, compressed</td><td>43 TB ÷ 10</td><td class="num">~4.3 TB/day</td></tr>
+      <tr><td>Hot, label-indexed (Loki-style), 7 days</td><td>4.3 TB × 7</td><td class="num">~30 TB in object storage</td></tr>
+      <tr><td>Hot, full-text (OpenSearch), 7 days</td><td>43 TB × ~1.1 (index) × 2 replicas × 7</td><td class="num">~660 TB of SSD</td></tr>
+      <tr><td>Kafka buffer, 6 h</td><td>500 MB/s × 21,600 s ÷ 4 (zstd) × RF 3</td><td class="num">~8 TB</td></tr>
+      <tr><td>One-service query, 1 h</td><td>1% of traffic × 1 h ≈ 18 GB raw</td><td class="num">~1.8 GB compressed: seconds with 50 parallel readers</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout"><b>What the numbers tell you</b><p>Storage design decides the cost by a factor of 20: indexing every word of 43 TB a day needs hundreds of terabytes of SSD, while indexing only labels and scanning compressed chunks in object storage needs about 30 TB of cheap storage. Queries are rare but heavy, so the design shifts cost from ingest time (indexing) to query time (scanning), and requires every query to say which services and what time range it wants.</p></div>
+
+  <h2 id="lf-h4">H4. API design</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Endpoint</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>logger.info(msg, fields)</code> (library)</td><td>The LLD API: named, hierarchical loggers; MDC for request id and trace id; level check before any formatting work</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/ingest</code> (or OTLP/gRPC)</td><td>Agent → gateway. Gzip or zstd batch; tenant API key; 429 with <code>Retry-After</code> when over quota</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/query?q=&amp;from=&amp;to=&amp;limit=&amp;cursor=</code></td><td><code>q = {service="checkout", level="ERROR"} |= "timeout" | json | trace_id="…"</code>. Time range required, with a maximum span per tier.</td></tr>
+      <tr><td><code>WS /v1/tail?q=</code></td><td>Live tail, rate-limited per connection, sampled when the stream is too fast to read</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/alerts</code></td><td><code>{query, window, threshold, channel}</code>, evaluated on the stream</td></tr>
+      <tr><td><span class="verb">PUT</span> <code>/v1/tenants/{t}/policy</code></td><td>Quota (MB/s), retention per level, redaction rules, sampling rules</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="lf-h5">H5. High-level design</h2>
+  <div class="diagram">{{lf-arch}}<p class="diagram-caption">Logs move through buffers at every hop: the library's ring buffer, the agent's disk buffer, Kafka. Each hop can absorb a slow next hop for a while without pushing back on the app.</p></div>
+  <ul>
+    <li><b>Library</b> (the LLD): writes structured JSON to stdout through a bounded asynchronous appender. It adds request id, trace id and service, and redacts known keys.</li>
+    <li><b>Agent</b> per node: tails container output, adds Kubernetes labels (namespace, pod, service), batches, compresses, and buffers to local disk when ingest pushes back.</li>
+    <li><b>Ingest gateway:</b> authenticates the tenant, enforces quotas, rejects malformed batches, and produces to Kafka with <code>acks=all</code>. It returns 200 only after Kafka has the data, so the agent can safely advance its checkpoint.</li>
+    <li><b>Kafka</b> decouples ingest from storage and lets several consumers read the same stream: processors, the alert engine and live tail.</li>
+    <li><b>Processors</b> parse, redact, sample (keep 100% of WARN and above, 10% of DEBUG) and write to the hot store in bulk. Old data rolls over to object storage, then to an archive tier.</li>
+    <li><b>Query service</b> splits a query by time and shard, runs the pieces in parallel against hot and cold storage, merges by timestamp, and enforces limits.</li>
+  </ul>
+  <div class="diagram">{{lf-seq}}<p class="diagram-caption">The processor commits its Kafka offset only after the store has the data. A crash means replaying a batch (a duplicate), not losing it.</p></div>
+
+  <h2 id="lf-h6">H6. Database (storage) design</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Approach</th><th>What is indexed</th><th>Good at</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td>Label index + chunks (Loki-style)</td><td>A few low-cardinality labels: tenant, service, level, env</td><td>"service X in this window, grep for Y"; cheap retention</td><td>Lowest. Free-text queries over wide ranges are slow.</td></tr>
+      <tr><td>Inverted index (OpenSearch / Elasticsearch)</td><td>Every term and field</td><td>Ad-hoc full-text search over everything, aggregations</td><td>Highest: SSD, replicas, heavy indexing CPU</td></tr>
+      <tr><td>Columnar (ClickHouse)</td><td>Sort key plus skip indexes</td><td>Structured fields, aggregations, high-cardinality filters</td><td>Middle. Excellent compression.</td></tr>
+    </tbody>
+  </table></div>
+  <p><b>Choice:</b> label index plus compressed chunks in object storage as the default tier, which keeps cost under control. Add a small full-text or columnar tier for the last 24 h of ERROR and WARN, where most investigations start.</p>
+  <div class="code" data-src="ts"><div class="code-head"><span>data layout</span><button type="button" data-copy>Copy</button></div><script type="text/plain">stream  = {tenant, service, env, level}             // label set → one stream; keep cardinality low
+chunk   = compressed block of lines for one stream, ~1–2 MB or 1 h, whichever comes first
+          s3://logs/{tenant}/{yyyy}/{mm}/{dd}/{hh}/{streamHash}/{chunkId}.zst
+index   = (tenant, label set, time bucket) → [chunkId, minTs, maxTs]        // small: GBs, not TBs
+          + optional bloom filter per chunk on trace_id / request_id → skip chunks that can't match
+retention by tier:  hot 7 d (fast storage) → warm 30 d (S3 standard) → archive 1 y (Glacier, restore on request)</script></div>
+  <ul>
+    <li><b>Never make request id or user id a label.</b> Each value would create its own stream and the index would explode. Keep them as fields in the line, and use per-chunk bloom filters to skip chunks.</li>
+    <li>Partition by tenant and time, so retention is "delete prefixes older than N days", never row-by-row deletes.</li>
+  </ul>
+
+  <h2 id="lf-h7">H7. Detailed component design</h2>
+  <h3>1 · Client library: never block the app</h3>
+  <p>This is the LLD: check the level before doing anything (lazy messages), put the record in a bounded queue, and let a background flusher write it out. When the queue is full, drop DEBUG and INFO first and keep WARN and above (the BufferedAppender policy), and increment a <code>logs_dropped_total{level}</code> metric so the loss is visible. A synchronous write to a slow disk or the network on the request thread is the classic way logging causes an outage (L2).</p>
+  <h3>2 · Agent and backpressure</h3>
+  <ul>
+    <li>The agent checkpoints its read position per file and advances it only after ingest returns 200. That gives at-least-once delivery across restarts.</li>
+    <li>If ingest returns 429 or 503, or is unreachable, the agent spills to a disk buffer (for example 5 GB per node, roughly an hour) and retries with jittered backoff. That way the agents don't all reconnect at the same moment when ingest recovers.</li>
+    <li>When the disk buffer is full, drop by priority and report the drops as metrics. Never fill the node's disk: that would kill the pods logging to it.</li>
+  </ul>
+  <h3>3 · Ingest, quotas and Kafka</h3>
+  <ul>
+    <li>Per-tenant token buckets in MB/s, with a burst allowance. A noisy team gets 429s, and its agents buffer, without affecting anyone else.</li>
+    <li>Kafka topics are partitioned by <code>hash(tenant, service)</code>, so lines from one stream stay ordered, with enough partitions (say 512) to scale consumers. Ordering across streams is by timestamp, decided at query time.</li>
+    <li>Processors are a consumer group. Lag is the key health metric and drives autoscaling.</li>
+  </ul>
+  <h3>4 · Redaction</h3>
+  <ul>
+    <li>Layer 1, in the library: known keys (<code>password</code>, <code>cardNumber</code>, <code>authorization</code>) are masked before the line exists. This is <code>redactKeys</code> from the LLD.</li>
+    <li>Layer 2, in the pipeline: regex and pattern detectors for card numbers (with a Luhn check), Aadhaar or PAN formats, emails and tokens. Matches are masked, and the event is counted per service so the owning team gets a ticket to fix it at the source.</li>
+    <li>Raw data never reaches storage. If you need the unredacted line for debugging, the answer is to log better fields, not to keep secrets.</li>
+  </ul>
+  <h3>5 · Query execution</h3>
+  <ul>
+    <li>Parse the query. Use the label selector and time range to find chunk ids from the index, then drop chunks with the bloom filter if there's a trace id or request id.</li>
+    <li>Split the work by time into 15-minute pieces, run them in parallel across querier pods, stream results back merged by timestamp, and stop at the limit.</li>
+    <li>Guardrails: a maximum time span per query (24 h unless you go through an async export), a maximum bytes scanned per tenant per minute, and a cache for repeated dashboard queries.</li>
+  </ul>
+
+  <h2 id="lf-h8">H8. Interviewer questions and counters</h2>
+  <details class="qa"><summary><span class="qn">Q1</span>Why put Kafka between the agents and storage? Agents could write directly.</summary><div class="qa-body">
+    <h4>Answer</h4><p>Three reasons. It absorbs bursts and outages in storage, which is the most fragile part (indexing, compaction), without pushing back on 20k agents. Several consumers can read the same stream: storage, the alert engine, live tail, a SIEM. And storage can be replayed after a bug. Without it, every storage hiccup becomes agent buffering on every node.</p>
+    <h4 class="change">Push-back: "Kafka is another big system to run."</h4><p>True. Below a few hundred MB/s, agents writing straight to the store with disk buffers is a reasonable start. Add Kafka when you need fan-out or the store can't absorb bursts.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q2</span>Elasticsearch or a Loki-style store?</summary><div class="qa-body">
+    <h4>Answer</h4><p>It depends on how people query and on budget. Full-text indexing of everything costs about 20× more at this volume (H3), and most queries are "this service, this time window, this string", which label filtering plus a scan handles well. So I'd use the label-indexed store by default, plus a small full-text tier for recent errors.</p>
+    <h4 class="change">Push-back: "Our engineers search across all services for a customer id."</h4><p>Then that field needs an index. Use per-chunk bloom filters on it, or send a copy of the logs with that field to a columnar store keyed by it. Pay to index the one field you search on, not every word.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q3</span>Why not just use metrics and traces? Logs are expensive.</summary><div class="qa-body">
+    <h4>Answer</h4><p>They answer different questions. Metrics tell you that something is wrong (cheap, aggregated). Traces tell you where (sampled request paths). Logs tell you why (detailed events). Reduce log volume by moving counts into metrics, sampling DEBUG, and raising levels at runtime only when needed (the LLD's <code>PUT /loggers/{name}/level</code>, L3). Putting trace ids in log lines connects all three.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q4</span>The whole logging pipeline is down. What happens to the apps?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Nothing visible. The library writes to stdout asynchronously, and the agent buffers to disk for about an hour. Beyond that the agent drops low-priority lines and counts them. No application thread ever waits for the pipeline. The cost is a gap or delay in logs, which is an observability incident, not a customer incident.</p>
+    <h4 class="change">Push-back: "Audit logs must not be lost."</h4><p>Audit events don't belong in the best-effort log pipeline. Write them to the database transactionally (an outbox) or to a durable topic with acknowledged writes. Different guarantee, different path.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q5</span>One team suddenly logs 10× more and slows everyone down.</summary><div class="qa-body">
+    <h4>Answer</h4><p>Per-tenant quotas at ingest (429 for that tenant only), separate Kafka partitions so their lag doesn't block other teams' consumers, and per-tenant query limits. Alert the team on their own drop and throttle metrics. If they need more, it's a budget conversation, and you can show cost per team because volume is tracked per tenant.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q6</span>Are logs in order?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Within one stream (one pod's output), yes: one Kafka partition, one chunk sequence. Across pods, only roughly, by timestamp, and clocks drift by milliseconds. For causality across services, use the trace id and span parent links, not timestamps. The query merges by timestamp and breaks ties by stream and sequence, so results are at least deterministic.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q7</span>How do you make sure no card numbers end up in storage?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Defence in depth: typed log fields with masking in the library, pipeline detectors that mask and report, a periodic scan of samples from storage, and a code review rule against logging whole request bodies. Report each detection to the owning team, because masking in the pipeline hides the bug without fixing it.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q8</span>Alert when checkout logs more than 50 errors a minute. Run it as a query every minute?</summary><div class="qa-body">
+    <h4>Answer</h4><p>No. Evaluate it on the stream: the alert engine consumes Kafka, keeps a sliding-window counter per rule and group key, and fires on the threshold with deduplication and a cool-down. Polling queries would scan storage every minute for every rule, and they'd be late by the ingest delay. For rate-style alerts, it's even better to emit a metric from the library and alert in the metrics system.</p>
+  </div></details>

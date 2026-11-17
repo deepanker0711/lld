@@ -1,0 +1,70 @@
+@base = http://localhost:3000
+
+### Restaurant in Koramangala
+# @name rst
+POST {{base}}/restaurants
+Content-Type: application/json
+
+{ "name": "Meghana Foods", "location": { "lat": 12.9352, "lng": 77.6245 },
+  "menu": [{ "name": "Chicken Biryani", "pricePaise": 32000 }, { "name": "Paneer Biryani", "pricePaise": 28000 }] }
+
+### Nearby restaurants (open, within 10 km, nearest first)
+GET {{base}}/restaurants?lat=12.9116&lng=77.6389
+
+### Agent near the restaurant
+# @name agent
+POST {{base}}/delivery-agents
+Content-Type: application/json
+
+{ "name": "Raju", "location": { "lat": 12.9365, "lng": 77.6260 } }
+
+### Place order (HSR Layout, 3.1 km) -> 201 PLACED, fee by distance
+# @name order
+POST {{base}}/food-orders
+Content-Type: application/json
+
+{ "customerId": "cust_1", "restaurantId": "{{rst.response.body.data.id}}",
+  "items": [{ "menuItemId": "{{rst.response.body.data.menu[0].id}}", "qty": 1 }],
+  "deliveryLocation": { "lat": 12.9116, "lng": 77.6389 } }
+
+### Agent tries to pick up before assignment -> 403
+POST {{base}}/food-orders/{{order.response.body.data.id}}/pick-up
+Content-Type: application/json
+
+{ "agentId": "{{agent.response.body.data.id}}" }
+
+### Restaurant accepts -> nearest free agent assigned
+POST {{base}}/food-orders/{{order.response.body.data.id}}/accept
+Content-Type: application/json
+
+{ "restaurantId": "{{rst.response.body.data.id}}" }
+
+### Customer can't cancel once the kitchen started -> 403
+POST {{base}}/food-orders/{{order.response.body.data.id}}/cancel
+Content-Type: application/json
+
+{ "customerId": "cust_1" }
+
+### Ready -> pick up -> deliver
+POST {{base}}/food-orders/{{order.response.body.data.id}}/ready
+Content-Type: application/json
+
+{ "restaurantId": "{{rst.response.body.data.id}}" }
+
+###
+POST {{base}}/food-orders/{{order.response.body.data.id}}/pick-up
+Content-Type: application/json
+
+{ "agentId": "{{agent.response.body.data.id}}" }
+
+###
+POST {{base}}/food-orders/{{order.response.body.data.id}}/deliver
+Content-Type: application/json
+
+{ "agentId": "{{agent.response.body.data.id}}" }
+
+### Order with full history
+GET {{base}}/food-orders/{{order.response.body.data.id}}
+
+### Agents (back to AVAILABLE at the customer's location)
+GET {{base}}/delivery-agents

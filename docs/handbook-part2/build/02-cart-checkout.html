@@ -1,0 +1,172 @@
+  <div class="part-banner" id="cc-hld"><p class="eyebrow">Part B · System design (HLD)</p><p class="part-title">Cart and checkout for a large e-commerce site</p><p>The LLD runs the whole checkout in one process, with a fake payment gateway that answers instantly. In production, inventory, orders and payments are separate services, payment confirmation arrives asynchronously, and a flash sale sends thousands of buyers at a single SKU.</p></div>
+
+  <h2 id="cc-h1">H1. Functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>In scope</th><th>Out of scope</th></tr></thead>
+    <tbody><tr><td><ul>
+      <li>A cart that persists across devices: add, update quantity, remove, see live prices</li>
+      <li>Apply one coupon, with validity, minimum order value and usage limits</li>
+      <li>Checkout: price the cart, reserve stock, take payment (UPI, cards, wallets), create the order</li>
+      <li>Order history, order status, cancellation and refund</li>
+      <li>Flash sales: limited stock at a fixed start time</li>
+    </ul></td><td><ul>
+      <li>Catalog search and browsing (a separate system)</li>
+      <li>Shipping, warehouses and fulfilment: consumers of <code>OrderConfirmed</code></li>
+      <li>Multi-seller split orders. Mention them: one order becomes several shipments.</li>
+      <li>Tax calculation beyond a flat GST rate</li>
+    </ul></td></tr></tbody>
+  </table></div>
+
+  <h2 id="cc-h2">H2. Non-functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quality</th><th>Target</th><th>Why, and what it forces</th></tr></thead>
+    <tbody>
+      <tr><td>No double charge</td><td>Exactly-once effect</td><td>Idempotency keys at our API, and the order id passed as the idempotency key to the payment provider (PSP).</td></tr>
+      <tr><td>No overselling</td><td>Strong consistency per SKU</td><td>Stock is decremented with a conditional update on one authoritative row. It is never computed from a cache.</td></tr>
+      <tr><td>Availability</td><td>Checkout 99.99% · cart 99.95%</td><td>Checkout is revenue. When the cart service is degraded, checkout still works from the last cart the client has.</td></tr>
+      <tr><td>Latency</td><td>Cart p99 &lt; 100 ms · checkout p99 &lt; 1.5 s</td><td>Measured up to the payment step; the payment itself is the PSP's latency.</td></tr>
+      <tr><td>Peak</td><td>20× normal during sales</td><td>Stateless services autoscale. The hot SKU row is the bottleneck, so it gets a component of its own (H7).</td></tr>
+      <tr><td>Durability</td><td>RPO 0 for orders and payments</td><td>Synchronous replica. Carts may lose the last few seconds of edits.</td></tr>
+      <tr><td>Auditability</td><td>Every money movement traceable</td><td>Order status history and append-only payment events.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="cc-h3">H3. Capacity estimation</h2>
+  <p>Assumptions: 20M DAU. 30% of them edit a cart, about 5 edits each. Carts are read 5 times per DAU per day (cart page, mini-cart badge). 1M orders a day, 3 lines each. Peak is 5× average, and a flash sale is 20×.</p>
+  <div class="table-wrap"><table class="calc">
+    <thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Cart writes</td><td>20M × 30% × 5 = 30M/day ≈ 350/s · ×5</td><td class="num">~1.7k/s peak</td></tr>
+      <tr><td>Cart reads</td><td>100M/day ≈ 1.2k/s · ×5</td><td class="num">~6k/s peak</td></tr>
+      <tr><td>Checkouts</td><td>1M/day ≈ 12/s · ×20 in a sale</td><td class="num">~230/s</td></tr>
+      <tr><td>One flash-sale SKU</td><td>100k buyers in the first 60 s</td><td class="num">~1.7k/s on ONE row</td></tr>
+      <tr><td>Cart storage</td><td>30M live carts × 2 KB</td><td class="num">~60 GB</td></tr>
+      <tr><td>Order storage</td><td>1M × 5 KB (lines, address, history)</td><td class="num">5 GB/day ≈ 1.8 TB/year</td></tr>
+      <tr><td>Kafka</td><td>~6 events per order × 1 KB</td><td class="num">6 GB/day</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout"><b>What the numbers tell you</b><p>Overall checkout throughput is modest: 230/s fits a single Postgres primary. The hard part is contention, not volume: 1.7k writes a second against a single inventory row, all trying to take the last few units. That decides the inventory design.</p></div>
+
+  <h2 id="cc-h4">H4. API design</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Endpoint</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><span class="verb">GET</span> <code>/v1/cart</code></td><td>The caller's cart with live prices, plus <code>warnings[]</code> for items whose price changed or that went out of stock. Returns an <code>ETag</code>.</td></tr>
+      <tr><td><span class="verb">PUT</span> <code>/v1/cart/items/{sku}</code> · <span class="verb">DELETE</span></td><td><code>{quantity}</code>. PUT is idempotent, so a retried "set quantity to 2" is harmless. A POST "add 1" retried would leave 3. Accepts <code>If-Match</code>.</td></tr>
+      <tr><td><span class="verb">PUT</span> <code>/v1/cart/coupon</code></td><td>422 with a reason: expired, minimum not met, or limit reached</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/checkout</code></td><td><code>Idempotency-Key</code> header required. Body: <code>{cartVersion, addressId, paymentMethod}</code>. 201 <code>{orderId, status: PENDING_PAYMENT, payment: {provider, clientSecret | redirectUrl}}</code>. 409 if stock is short (with the SKUs), 412 if the cart changed since the client read it.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/payments/webhooks/{provider}</code></td><td>Signature verified; deduplicated on the PSP's event id; always 200 once the event is stored</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/orders?cursor=</code> · <code>/v1/orders/{id}</code></td><td>Cursor pagination on <code>(created_at, id)</code>. The client polls the order or listens for push while payment is pending.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/orders/{id}/cancel</code></td><td>Allowed before shipping. Triggers the refund saga and returns 202.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The difference from the LLD: checkout returns <b>PENDING_PAYMENT</b> and a payment action, not a confirmed order. Real payments (UPI collect, 3-D Secure) finish on the user's phone or the bank's page, and confirmation arrives later by webhook.</p>
+
+  <h2 id="cc-h5">H5. High-level design</h2>
+  <div class="diagram">{{cc-arch}}<p class="diagram-caption">One service per business area, each with its own database. Checkout orchestrates the saga. Every state change writes an outbox row in the same transaction, and a relay publishes it to Kafka.</p></div>
+  <ul>
+    <li><b>Cart</b> is a key-value document per user, read-heavy and cached. Prices are not stored in the cart: they are fetched live from pricing, which is cached for 60 seconds.</li>
+    <li><b>Checkout</b> owns orders and the saga. It talks to inventory and payment synchronously for the steps the user waits on, and consumes payment events asynchronously.</li>
+    <li><b>Inventory</b> is the only writer of stock. It keeps reservations with an expiry time, and a sweeper releases the expired ones.</li>
+    <li><b>Payment</b> wraps the PSPs behind one interface (Strategy, as in the LLD), stores every webhook, and runs reconciliation.</li>
+  </ul>
+  <div class="diagram">{{cc-seq}}<p class="diagram-caption">The checkout saga. The user waits for steps 1–9 only. Confirmation is asynchronous, and every step can be retried safely because each one is keyed: the idempotency key, the reservation id, the order id sent to the PSP, and the PSP's event id.</p></div>
+
+  <h2 id="cc-h6">H6. Database design</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Data</th><th>Store</th><th>Key / shard</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Cart</td><td>DynamoDB / Cassandra (or Redis with AOF)</td><td><code>user_id</code></td><td>Single-key reads and writes, no joins, TTL for abandoned carts</td></tr>
+      <tr><td>Orders</td><td>Postgres</td><td><code>user_id</code></td><td>Transactions across order, lines, outbox and idempotency key; "my orders" stays on one shard</td></tr>
+      <tr><td>Inventory</td><td>Postgres</td><td><code>sku</code></td><td>Conditional updates; a reservation and its stock row live on the same shard</td></tr>
+      <tr><td>Payments</td><td>Postgres</td><td><code>order_id</code></td><td>Unique constraints on the PSP reference and the webhook event id</td></tr>
+    </tbody>
+  </table></div>
+  <div class="code" data-src="sql"><div class="code-head"><span>orders + inventory (key tables)</span><button type="button" data-copy>Copy</button></div><script type="text/plain">CREATE TABLE orders (
+  id uuid PRIMARY KEY, user_id uuid NOT NULL,
+  status text NOT NULL,                       -- PENDING_PAYMENT | CONFIRMED | PAYMENT_FAILED | CANCELLED
+  subtotal_paise bigint, discount_paise bigint, tax_paise bigint, total_paise bigint,
+  coupon_code text, reservation_id uuid, version int NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX orders_by_user ON orders (user_id, created_at DESC, id);
+CREATE INDEX orders_pending ON orders (created_at) WHERE status = 'PENDING_PAYMENT';   -- reconciler
+CREATE TABLE order_lines (order_id uuid, sku text, name text, unit_price_paise bigint, qty int,
+                          PRIMARY KEY (order_id, sku));            -- snapshot: never re-priced
+CREATE TABLE idempotency_keys (user_id uuid, key text, fingerprint bytea, order_id uuid,
+                               response jsonb, created_at timestamptz, PRIMARY KEY (user_id, key));
+CREATE TABLE outbox (id bigserial PRIMARY KEY, aggregate_id uuid, type text, payload jsonb,
+                     created_at timestamptz DEFAULT now(), published_at timestamptz);
+
+-- inventory service
+CREATE TABLE stock (sku text PRIMARY KEY, available int NOT NULL CHECK (available >= 0),
+                    reserved int NOT NULL CHECK (reserved >= 0));
+CREATE TABLE reservations (id uuid PRIMARY KEY, order_id uuid UNIQUE, status text,  -- HELD | COMMITTED | RELEASED
+                           expires_at timestamptz NOT NULL);
+CREATE TABLE reservation_lines (reservation_id uuid, sku text, qty int, PRIMARY KEY (reservation_id, sku));
+CREATE INDEX reservations_expiring ON reservations (expires_at) WHERE status = 'HELD';</script></div>
+  <ul>
+    <li><code>CHECK (available &gt;= 0)</code> is the last line of defence. Even buggy code can't oversell.</li>
+    <li><code>orders.version</code> gives optimistic concurrency for status changes: <code>UPDATE … SET status = 'CONFIRMED', version = version + 1 WHERE id = $1 AND status = 'PENDING_PAYMENT'</code>. A duplicate webhook then updates 0 rows and does nothing.</li>
+    <li>Coupon usage limits are a counter row (<code>coupons.used</code>) incremented with <code>WHERE used &lt; max_uses</code>, in the same transaction that creates the order.</li>
+  </ul>
+
+  <h2 id="cc-h7">H7. Detailed component design</h2>
+  <h3>1 · Inventory reservation</h3>
+  <div class="code" data-src="sql"><div class="code-head"><span>reserve (one transaction, lines sorted by sku to avoid deadlocks)</span><button type="button" data-copy>Copy</button></div><script type="text/plain">UPDATE stock SET available = available - $qty, reserved = reserved + $qty
+ WHERE sku = $sku AND available >= $qty;          -- 0 rows → short: roll back, 409 with this sku
+-- after all lines succeed:
+INSERT INTO reservations (id, order_id, status, expires_at) VALUES ($r, $order, 'HELD', now() + interval '15 min');
+-- commit:  reserved -= qty,                       status = COMMITTED
+-- release: available += qty, reserved -= qty,     status = RELEASED   (guarded by WHERE status = 'HELD')</script></div>
+  <p>The status guard makes commit and release mutually exclusive. If the sweeper releases a reservation at the same moment the payment webhook commits it, only one of them changes the row. Section 4 below covers the case where the sweeper wins.</p>
+  <h3>2 · The hot SKU in a flash sale</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Technique</th><th>How</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td>Admission gate</td><td>Redis <code>DECR sale:{sku}:tokens</code>, seeded with the stock. Only buyers who get a token ≥ 0 reach the database.</td><td>The database row sees about as many writes as there are units in stock, not 100k buyers.</td></tr>
+      <tr><td>Split counters</td><td>Stock spread across N rows (<code>sku#0 … sku#7</code>). Reserve from a random bucket and try the next one when it's empty.</td><td>N× write throughput. "Out of stock" now means checking all N buckets.</td></tr>
+      <tr><td>Waiting room</td><td>Users are queued at the edge and let in at a fixed rate</td><td>Protects every service downstream. It's the best user experience under extreme load.</td></tr>
+      <tr><td>Per-user limit</td><td>A unique row per (sale, user)</td><td>Stops scripts buying everything</td></tr>
+    </tbody>
+  </table></div>
+  <p>Redis is only a gate. The Postgres row stays the source of truth, so a lost Redis key can let a few extra buyers through to the database, where the conditional update still refuses them.</p>
+  <h3>3 · Payment integration</h3>
+  <ul>
+    <li>The payment intent is created with <code>idempotency_key = order_id</code> at the PSP, so a retried "create" never makes a second charge.</li>
+    <li>Webhooks: verify the HMAC signature, then <code>INSERT INTO payment_events (psp_event_id UNIQUE …)</code>. A duplicate violates the constraint and we return 200 without doing anything. Then publish <code>PaymentSucceeded</code> through the outbox.</li>
+    <li>The reconciler runs every minute. For each order <code>PENDING_PAYMENT</code> older than 15 minutes it asks the PSP for the status. Webhooks get lost, and the reconciler is what makes the system correct anyway.</li>
+    <li>Daily settlement reconciliation compares the PSP's settlement file with our captured payments and flags mismatches for finance.</li>
+  </ul>
+  <h3>4 · Late payment after the reservation expired</h3>
+  <p>The user pays at 15:30 for a reservation that expired at 15:29, and the stock went to someone else. On <code>PaymentSucceeded</code>, checkout tries to commit. If the reservation is already <code>RELEASED</code>, it tries to <b>re-reserve</b>. If that succeeds the order is confirmed. If not, the order becomes <code>CANCELLED</code> with reason <code>STOCK_EXPIRED</code>, an automatic refund is issued, and the user is told. Prevention is better: make the reservation TTL longer than the PSP's payment window, and tell the PSP to expire the payment link before the reservation expires.</p>
+
+  <h2 id="cc-h8">H8. Interviewer questions and counters</h2>
+  <details class="qa"><summary><span class="qn">Q1</span>Why a saga? Use a distributed transaction (2PC) across orders, inventory and payment.</summary><div class="qa-body">
+    <h4>Answer</h4><p>The PSP is an external system that doesn't take part in our transactions, and payment can take minutes (UPI approval on the phone). 2PC would hold locks on stock rows for that long and block on the coordinator. A saga uses local transactions plus compensations: release stock, refund. Each step is idempotent and the orchestrator's state is in the orders table, so a crash simply resumes.</p>
+    <h4 class="change">Push-back: "Sagas leave the system temporarily inconsistent."</h4><p>Yes, and the states say so honestly: <code>PENDING_PAYMENT</code> with stock held. The user sees "payment pending", which is the truth. The invariants that matter (stock never negative, never charged twice) hold at every step, because they're enforced inside single-database transactions.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q2</span>Orchestration or choreography for the saga?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Orchestration, by checkout. The order flow is the core business process: one place should own its state machine, its timeouts and its compensations, and you can debug an order by reading one row. Choreography, where each service reacts to the others' events, is fine for side effects such as email, analytics and search indexing, and those consume <code>OrderConfirmed</code>.</p>
+    <h4 class="change">Push-back: "The orchestrator is a single point of failure."</h4><p>It's stateless pods over a replicated database. If a pod dies, another one picks the saga up from the order row and the outbox. It's a hotspot of <i>logic</i>, not of availability.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q3</span>Why reserve stock at checkout and not when the item is added to the cart?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Most carts are abandoned. Reserving at add-to-cart lets idle carts lock up stock, and a competitor could hoard it with bots. Reserving at checkout holds stock only for people who are actually paying, and only for 15 minutes. The cart shows "only 2 left" as information, not a promise. (The LLD's C3 covers this from the code side.)</p>
+    <h4 class="change">Push-back: "The user loses the item at checkout. Bad experience."</h4><p>For scarce items, do a short soft hold when the user enters checkout (the address step), and use a waiting room for drops. For ordinary stock the chance is tiny and the message is clear.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q4</span>Why not keep stock in Redis? It's faster.</summary><div class="qa-body">
+    <h4>Answer</h4><p>Redis failover can lose acknowledged writes, because replication is asynchronous. With stock that means overselling or phantom stock. Keep Redis as an admission gate in front, and let the database row (with its <code>CHECK</code> constraint) have the final say.</p>
+    <h4 class="change">Push-back: "Postgres can't do 1.7k/s on one row."</h4><p>Correct. That's why the gate exists: once the tokens run out, the database stops seeing traffic. If the stock itself is large (say 50k units), split the counter across buckets.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q5</span>The webhook arrives before the client's checkout call has even returned. Problem?</summary><div class="qa-body">
+    <h4>Answer</h4><p>It can happen with fast payment methods. The order row is committed (step 5) before the intent is created (step 6), so the webhook always finds the order. The confirm is a conditional update from <code>PENDING_PAYMENT</code>, so the order doesn't care which arrives first.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q6</span>How do you guarantee the event is published if the service crashes right after committing?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Transactional outbox. The event row is written in the same transaction as the state change. A relay (polling, or Debezium reading the database's change log) publishes it and marks it sent. Delivery is at least once, so consumers deduplicate on event id. Writing to the database and then calling Kafka separately ("dual write") loses events on crashes.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q7</span>Microservices from day one?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Not necessarily. A modular monolith with the same boundaries (cart, checkout, inventory, payment, each owning its own tables, talking through interfaces and an in-process outbox) gets 90% of the design benefit, and real transactions are a bonus. Split a module out when it needs independent scaling or its own team: inventory during sales, and payment for PCI compliance.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q8</span>The price changes between viewing the cart and paying. Which price is charged?</summary><div class="qa-body">
+    <h4>Answer</h4><p>The price on the order snapshot, which is taken at checkout. Checkout sends the cart <code>version</code> it priced. If pricing has changed since, return 412 with the new totals, and the client shows "price updated, confirm?". After the order is created, its lines are frozen: the webhook confirms the stored total and never re-prices.</p>
+  </div></details>

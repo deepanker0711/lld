@@ -1,0 +1,69 @@
+@base = http://localhost:3000
+
+### 1. Wallets (one per user)
+# @name asha
+POST {{base}}/wallets
+Content-Type: application/json
+
+{ "userId": "asha" }
+
+###
+# @name ravi
+POST {{base}}/wallets
+Content-Type: application/json
+
+{ "userId": "ravi" }
+
+### 2. Top-up ₹1000 -> 201 SUCCESS
+POST {{base}}/wallets/{{asha.response.body.data.id}}/top-ups
+Content-Type: application/json
+Idempotency-Key: topup-asha-0001
+
+{ "amountPaise": 100000, "paymentToken": "tok_ok" }
+
+### 3. Same key -> 200 Idempotent-Replayed (not charged again)
+POST {{base}}/wallets/{{asha.response.body.data.id}}/top-ups
+Content-Type: application/json
+Idempotency-Key: topup-asha-0001
+
+{ "amountPaise": 100000, "paymentToken": "tok_ok" }
+
+### 4. Same key, different amount -> 422
+POST {{base}}/wallets/{{asha.response.body.data.id}}/top-ups
+Content-Type: application/json
+Idempotency-Key: topup-asha-0001
+
+{ "amountPaise": 5, "paymentToken": "tok_ok" }
+
+### 5. Transfer ₹400 to Ravi
+POST {{base}}/wallets/{{asha.response.body.data.id}}/transfers
+Content-Type: application/json
+Idempotency-Key: trf-asha-0001
+
+{ "toWalletId": "{{ravi.response.body.data.id}}", "amountPaise": 40000, "note": "lunch" }
+
+### 6. More than the balance -> 422 { balancePaise, requestedPaise }
+POST {{base}}/wallets/{{asha.response.body.data.id}}/transfers
+Content-Type: application/json
+Idempotency-Key: trf-asha-0002
+
+{ "toWalletId": "{{ravi.response.body.data.id}}", "amountPaise": 70000 }
+
+### 7. Withdrawal to a closed account (ends 0000) -> 422; money comes back as a reversal entry
+POST {{base}}/wallets/{{asha.response.body.data.id}}/withdrawals
+Content-Type: application/json
+Idempotency-Key: wd-asha-0001
+
+{ "amountPaise": 10000, "bankAccount": "123450000" }
+
+### 8. Statement (ledger entries, newest first)
+GET {{base}}/wallets/{{asha.response.body.data.id}}/statement?page=1&limit=10
+
+### 9. Reconcile: cached balance == sum of ledger entries
+GET {{base}}/wallets/{{asha.response.body.data.id}}/reconcile
+
+### 10. Whole ledger: credits − debits = 0
+GET {{base}}/wallets/ledger-check
+
+### 11. Freeze -> transfers to/from it are 422
+POST {{base}}/wallets/{{ravi.response.body.data.id}}/freeze

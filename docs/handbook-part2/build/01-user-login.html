@@ -1,0 +1,191 @@
+  <div class="part-banner" id="ul-hld"><p class="eyebrow">Part B · System design (HLD)</p><p class="part-title">Identity service for a 50M-user product</p><p>The LLD above is one auth module. Here it becomes an identity service that many other services trust, built to survive login floods, credential stuffing and a region going down.</p></div>
+
+  <h2 id="ul-h1">H1. Functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>In scope</th><th>Out of scope (say it out loud)</th></tr></thead>
+    <tbody>
+      <tr><td>
+        <ul>
+          <li>Sign up with email + password, with an email verification link</li>
+          <li>Log in, refresh, log out, log out everywhere, list and revoke devices</li>
+          <li>Forgot password: one-time reset link</li>
+          <li>Lockout and throttling against brute force and credential stuffing</li>
+          <li>Roles; other services can check who the caller is and what roles they have</li>
+          <li>Audit trail of logins, failures and revocations</li>
+        </ul>
+      </td><td>
+        <ul>
+          <li>Social login / SSO (OIDC). The design accepts it as another way to create a session.</li>
+          <li>MFA (covered as U7 in the LLD follow-ups)</li>
+          <li>Fine-grained permissions (ABAC, ReBAC). Roles only.</li>
+          <li>Profile management beyond name and email</li>
+        </ul>
+      </td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="ul-h2">H2. Non-functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quality</th><th>Target</th><th>Why, and what it forces</th></tr></thead>
+    <tbody>
+      <tr><td>Availability of token verification</td><td>99.99%+</td><td>Every API call in the company depends on it. So verification must not call the auth service: services verify signatures locally.</td></tr>
+      <tr><td>Availability of login / refresh</td><td>99.95%</td><td>If login is down, nobody new gets in, but people who are already logged in keep working until their refresh fails.</td></tr>
+      <tr><td>Latency</td><td>verify &lt; 1 ms (local) · login p99 &lt; 300 ms</td><td>Login is dominated by the deliberately slow password hash (~50 ms).</td></tr>
+      <tr><td>Security</td><td>OWASP ASVS L2</td><td>Slow salted hashing, no account enumeration, tokens hashed at rest, keys in KMS, TLS everywhere.</td></tr>
+      <tr><td>Revocation delay</td><td>&lt; 5 s after logout</td><td>Short-lived JWTs alone give 15 minutes. A pushed deny list closes the gap.</td></tr>
+      <tr><td>Durability</td><td>RPO 0 for users and sessions</td><td>Losing a password change or a revocation is a security bug, so writes go to a synchronous replica.</td></tr>
+      <tr><td>Privacy</td><td>DPDP / GDPR</td><td>Emails and IPs are personal data: encrypt at rest, keep audit logs for a fixed period, support deletion.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="ul-h3">H3. Capacity estimation</h2>
+  <p>Assumptions: 50M registered users, 10M daily active users (DAU), one login per DAU per day, about 1 hour of active use per day, 200 API calls per active user per day. Peak is 5× average.</p>
+  <div class="table-wrap"><table class="calc">
+    <thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Logins</td><td>10M / 86,400 s ≈ 116/s · ×5 peak</td><td class="num">~600/s peak</td></tr>
+      <tr><td>CPU for hashing</td><td>600/s × 50 ms of one core</td><td class="num">30 cores at peak</td></tr>
+      <tr><td>Refreshes</td><td>1 h ÷ 15 min = 4 per user per day → 40M/day ≈ 463/s · ×5</td><td class="num">~2,300/s peak</td></tr>
+      <tr><td>Token verifications</td><td>10M × 200 = 2B/day ≈ 23k/s · ×5</td><td class="num">~115k/s peak (local, no network)</td></tr>
+      <tr><td>Users table</td><td>50M × ~500 B</td><td class="num">~25 GB</td></tr>
+      <tr><td>Active sessions</td><td>10M × 2 devices × ~300 B</td><td class="num">~6 GB</td></tr>
+      <tr><td>Deny list (revoked, not yet expired)</td><td>~1M logouts/day spread over 96 fifteen-minute windows</td><td class="num">~10k entries</td></tr>
+      <tr><td>Audit events</td><td>~15M/day × 300 B</td><td class="num">~4.5 GB/day → ~1.6 TB/year</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout"><b>What the numbers tell you</b><p>The data is small: a single Postgres primary holds it all. The real costs are CPU for hashing (30 cores just to log people in at peak) and verification traffic, which is why verification has to be local. The deny list is small enough to sit in every service's memory.</p></div>
+
+  <h2 id="ul-h4">H4. API design</h2>
+  <p>The same contract as the LLD (section 4), versioned under <code>/v1</code>, plus the endpoints a real product needs. Web clients get the refresh token in an <code>HttpOnly; Secure; SameSite=Strict</code> cookie scoped to <code>/v1/auth</code>; mobile clients get it in the body.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Endpoint</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><span class="verb">POST</span> <code>/v1/auth/register</code></td><td>202, then a verification email goes out. The response is the same whether or not the email already exists, so it can't be used to discover accounts.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/auth/verify-email</code></td><td>Body: a one-time token from the link. Its hash is stored and it expires in 24 h.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/auth/login</code></td><td>200 token pair · 401 (same message for every failure) · 429 with <code>Retry-After</code></td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/auth/refresh</code></td><td>Rotates the refresh token. 401 on reuse, and the whole session is revoked.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/auth/logout</code> · <code>/logout-all</code></td><td>204. Writes the deny-list entry before responding.</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/auth/sessions</code> · <span class="verb">DELETE</span> <code>/sessions/{id}</code></td><td>Device list with last-used time, IP city and user agent.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/auth/password/forgot</code> · <code>/password/reset</code></td><td>forgot always returns 202. reset revokes every session.</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/.well-known/jwks.json</code></td><td>Public keys with <code>kid</code>. Cacheable (<code>Cache-Control: max-age=300</code>).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="ul-h5">H5. High-level design</h2>
+  <div class="diagram">{{ul-arch}}<p class="diagram-caption">The auth service is the only component that can mint tokens. Every other service verifies them locally with the cached public key and a small set of revoked session ids that is pushed to it.</p></div>
+  <h3>Request paths</h3>
+  <ul>
+    <li><b>Login:</b> gateway (per-IP limit) → auth service → Redis (per-account failure count) → Postgres (user) → scrypt → new session row → signed access JWT + opaque refresh token.</li>
+    <li><b>Any other API call:</b> the service verifies the JWT signature with the cached JWKS, checks <code>exp</code>, and checks <code>sid</code> against its in-memory deny set. There is no network hop, so auth adds no latency and can't take the call down.</li>
+    <li><b>Logout:</b> the session is revoked in Postgres, <code>revoked:{sid}</code> is written to Redis with a TTL equal to the access-token lifetime and published on a channel. Every service adds the sid to its local deny set within a second or two.</li>
+    <li><b>Side effects</b> (verification and reset emails, audit, fraud scoring) are driven by events written through an outbox, so login never waits on email.</li>
+  </ul>
+  <div class="diagram">{{ul-seq}}<p class="diagram-caption">Rotation is a compare-and-set on the stored hash. When an old token is presented again, the lookup finds it in the session's history, and that is how reuse is detected.</p></div>
+
+  <h2 id="ul-h6">H6. Database design</h2>
+  <p><b>Choice: Postgres.</b> The data is relational and small (~30 GB), it needs unique constraints (email) and transactional compare-and-set (rotation), and the traffic is a few thousand writes a second at most. A key-value store buys scale this system doesn't need and gives up the constraints it does need.</p>
+  <div class="code" data-src="sql"><div class="code-head"><span>schema</span><button type="button" data-copy>Copy</button></div><script type="text/plain">CREATE TABLE users (
+  id               uuid PRIMARY KEY,
+  email            citext NOT NULL UNIQUE,          -- case-insensitive unique
+  password_hash    text NOT NULL,                   -- scrypt$N$salt$hash
+  status           text NOT NULL DEFAULT 'PENDING', -- PENDING | ACTIVE | DISABLED
+  email_verified_at timestamptz,
+  authz_version    int  NOT NULL DEFAULT 1,         -- bump on role change / password reset
+  created_at       timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE user_roles (user_id uuid REFERENCES users ON DELETE CASCADE, role text, PRIMARY KEY (user_id, role));
+
+CREATE TABLE sessions (
+  id                 uuid PRIMARY KEY,
+  user_id            uuid NOT NULL REFERENCES users,
+  refresh_hash       bytea NOT NULL UNIQUE,         -- current token only
+  expires_at         timestamptz NOT NULL,          -- absolute 7-day cap
+  revoked_at         timestamptz,
+  revoke_reason      text,
+  device             text, ip inet, last_used_at timestamptz
+);
+CREATE INDEX sessions_active_by_user ON sessions (user_id) WHERE revoked_at IS NULL;
+
+-- every hash a session ever had: reuse detection survives rotation
+CREATE TABLE refresh_history (hash bytea PRIMARY KEY, session_id uuid NOT NULL, rotated_at timestamptz NOT NULL);
+
+CREATE TABLE one_time_tokens (                      -- email verify + password reset
+  hash bytea PRIMARY KEY, user_id uuid NOT NULL, purpose text NOT NULL,
+  expires_at timestamptz NOT NULL, used_at timestamptz
+);
+
+CREATE TABLE login_events (                         -- append-only, partitioned by month
+  at timestamptz NOT NULL, user_id uuid, email_hash bytea, ip inet, outcome text, reason text
+) PARTITION BY RANGE (at);</script></div>
+  <ul>
+    <li><b>Failure counters and lockouts live in Redis</b> (<code>INCR fails:{email}</code> with a 15-minute TTL), not in the users row. That keeps a hot write off the primary, and counters can be lost without harm: losing one only gives an attacker a few more guesses.</li>
+    <li><b>Retention:</b> expired sessions and their history rows are deleted by a nightly job. <code>login_events</code> partitions are dropped after the retention period, so nothing has to be deleted row by row.</li>
+    <li><b>If it outgrows one primary:</b> shard <code>users</code> by <code>hash(email)</code>, because login looks users up by email, and keep a small <code>user_id → shard</code> directory. Sessions go on the same shard as their user.</li>
+  </ul>
+
+  <h2 id="ul-h7">H7. Detailed component design</h2>
+  <h3>1 · Token signing and key rotation</h3>
+  <ul>
+    <li>Access tokens are signed with EdDSA or RS256 using a private key that never leaves KMS. The auth service asks KMS to sign, or holds a short-lived data key. Verifiers only ever get the public key.</li>
+    <li>JWKS publishes two keys at a time, <b>current</b> and <b>next</b>. To rotate: publish <i>next</i>, wait longer than the JWKS cache TTL (5 min), start signing with it, and retire the old key after one access-token lifetime (15 min). Each token's <code>kid</code> header says which key to use.</li>
+    <li>Claims: <code>iss, aud, sub, sid, roles, av (authz_version), iat, exp</code>. Verifiers check <code>aud</code>, so a token issued for one service can't be replayed against another.</li>
+  </ul>
+  <h3>2 · Refresh rotation as compare-and-set</h3>
+  <div class="code" data-src="sql"><div class="code-head"><span>refresh, in one transaction</span><button type="button" data-copy>Copy</button></div><script type="text/plain">UPDATE sessions SET refresh_hash = $new, last_used_at = now()
+ WHERE refresh_hash = $old AND revoked_at IS NULL AND expires_at > now()
+RETURNING id, user_id;
+-- 1 row  → INSERT INTO refresh_history (hash=$old, …); issue new pair
+-- 0 rows → SELECT session_id FROM refresh_history WHERE hash = $old
+--          found  → reuse: revoke that session, publish revocation, 401
+--          absent → unknown or expired token, 401</script></div>
+  <p>The <code>WHERE refresh_hash = $old</code> makes two concurrent refreshes safe without an application lock: Postgres row locking guarantees exactly one of them updates the row. The grace window for legitimate double refreshes (two tabs) is U3 in the LLD.</p>
+  <h3>3 · Revocation propagation</h3>
+  <ul>
+    <li>On revoke: <code>SET revoked:{sid} 1 PX 900000</code> plus <code>PUBLISH revocations {sid, exp}</code>.</li>
+    <li>Each service runs a small subscriber that adds the sid to an in-memory set and drops entries once their tokens have expired. At start-up it loads the current set with <code>SCAN revoked:*</code>, which holds about 10k keys.</li>
+    <li>If the subscriber disconnects, the service checks Redis per request until it has caught up again. If Redis is unreachable as well, it fails open for low-risk reads and fails closed for money movement. That policy is decided per endpoint, not left to chance.</li>
+  </ul>
+  <h3>4 · Brute-force and credential-stuffing defence</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Layer</th><th>Key</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td>Edge (WAF)</td><td>IP, ASN, known-bad lists</td><td>Block, or challenge with a CAPTCHA</td></tr>
+      <tr><td>Per IP</td><td><code>login:ip:{ip}</code> sliding window</td><td>429 when there are too many attempts across many accounts</td></tr>
+      <tr><td>Per account</td><td><code>fails:{email}</code></td><td>Increasing delay after 3 failures, a CAPTCHA after 5, a temporary lock after 10. The user is notified by email.</td></tr>
+      <tr><td>Global</td><td>failure ratio per minute</td><td>A credential-stuffing alarm that switches on CAPTCHA for everyone</td></tr>
+      <tr><td>Passwords</td><td>k-anonymity check against breached-password lists</td><td>Reject breached passwords at signup and reset</td></tr>
+    </tbody>
+  </table></div>
+  <p>Hashing runs in a separate worker pool with a bounded queue. When the queue is full, login returns 503 with <code>Retry-After</code> instead of letting a flood starve refresh and verification traffic on the same pods.</p>
+
+  <h2 id="ul-h8">H8. Interviewer questions and counters</h2>
+  <details class="qa"><summary><span class="qn">Q1</span>Why JWTs at all? Opaque session ids in Redis are simpler and revocable.</summary><div class="qa-body">
+    <h4>Answer</h4><p>With opaque ids, every API call in every service needs a network lookup. At 115k checks a second, that makes the session store a single point of failure for the whole company. A JWT moves verification into each service's own process. We keep only the part that can't be stateless, revocation, and it's a small set that is pushed to every service.</p>
+    <h4 class="change">Push-back: "So you have state anyway. Why not go fully stateful?"</h4><p>The state we keep is about 10k entries that change rarely. It's pushed to services, not queried, so if it's unavailable a service is a few seconds stale, not down. A session store would hold 20M entries and be on every request's critical path. For a single monolith with one database I'd happily use opaque sessions.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q2</span>Why not validate tokens once at the API gateway and trust everything behind it?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Gateway validation is a good first filter, and it's what I'd do for external traffic. But internal calls (service to service, async consumers acting on a user's behalf) don't pass through the gateway. If services trust a header such as <code>X-User-Id</code>, a single compromised pod can impersonate anyone.</p>
+    <h4 class="change">Push-back: "Verifying in every service duplicates work."</h4><p>Verification is one signature check, cheap and done locally. Put it in a shared library or the sidecar of a service mesh, so each team doesn't write its own.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q3</span>The users database is in Mumbai. You launch in Singapore. What changes?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Verification already works anywhere: JWKS is public and cached. Login and refresh need writes. Option A: give each user a home region, and route login and refresh there through a global directory keyed by email hash. That adds latency only to logins. Option B: run Postgres in every region with the user rows replicated, accepting a few seconds of lag for password changes. I'd pick A, because security writes (revocation, password reset) shouldn't be able to diverge between regions.</p>
+    <h4 class="change">Push-back: "Mumbai is down. Can Singapore users log in?"</h4><p>With A, users whose home is Mumbai can't log in or refresh, but their access tokens keep working everywhere until they expire, and users at home in Singapore are unaffected. If that's unacceptable, keep a read replica in each region and allow refresh in read-only mode: issue new access tokens but skip the rotation. That's a deliberate, temporary loss of reuse detection.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q4</span>A hard lockout after 5 failures lets an attacker lock out any user. Fix it.</summary><div class="qa-body">
+    <h4>Answer</h4><p>Lock the <i>combination</i> rather than the account: count failures per (account, IP or device fingerprint), so the attacker's IP gets locked, not the user's laptop. Account-wide, use increasing delays and a CAPTCHA instead of a hard lock, and always let the user through with a password-reset link or a known-device cookie.</p>
+    <h4 class="change">Push-back: "The attacker rotates through 10,000 IPs."</h4><p>Then the per-IP counters never trigger, but the account-wide CAPTCHA and the global failure-ratio alarm do. Botnets can't easily solve CAPTCHAs at scale. Offering MFA turns a correct guess into a non-event.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q5</span>A login flood is burning all your CPU on scrypt. What do you do?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Reject before hashing: the IP and account limits, CAPTCHA and the WAF all run before the expensive step. The hash pool has a bounded queue and sheds load with 503. It runs on its own pods, so refresh (a cheap SHA-256) and verification (local) keep working. Autoscale on queue depth.</p>
+    <h4 class="change">Push-back: "Just lower the scrypt cost then."</h4><p>That makes offline cracking of a leaked database proportionally cheaper, and that's the threat the cost exists for. Tune it once, about 50 ms on the hardware you use, and handle load with capacity and admission control. The cost is stored in each hash, so it can go up later without forcing anyone to reset.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q6</span>Why is the refresh token opaque and not another JWT?</summary><div class="qa-body">
+    <h4>Answer</h4><p>A refresh token is only ever checked by the auth service, which has the database anyway, so a self-contained token gains nothing. Being opaque means that what's stored is just a hash, and rotation and revocation are a single row update. A JWT refresh token would need a database check anyway to detect reuse.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q7</span>Access token lifetime: why 15 minutes? Why not 1 minute or 24 hours?</summary><div class="qa-body">
+    <h4>Answer</h4><p>It bounds how long a stolen access token works if the deny list misses it, and it decides how much refresh traffic there is. At 1 minute, refreshes would rise 15× to about 35k/s at peak: real write load on Postgres. At 24 hours, a stolen token is valuable for a day. 15 minutes keeps refresh load at about 2.3k/s, and the deny list covers the gap.</p>
+    <h4 class="change">Push-back: "Banking apps use 5 minutes."</h4><p>Then make it a setting per client: the banking app uses 5 minutes and higher refresh load, the content app uses 30. The design doesn't change.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q8</span>How do you build "Sign in with Google" into this?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Add an <code>identities(provider, subject, user_id)</code> table. The OIDC callback verifies Google's ID token (signature, <code>aud</code>, <code>nonce</code>), finds or links the user, then creates <b>our own</b> session the same way password login does. Everything after that point (refresh, revocation, roles) is unchanged. Link to an existing account only if Google says the email is verified, and ask for the existing password the first time, so nobody takes over an account by registering its email with another provider.</p>
+  </div></details>

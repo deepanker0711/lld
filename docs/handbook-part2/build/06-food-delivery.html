@@ -1,0 +1,152 @@
+  <div class="part-banner" id="fd-hld"><p class="eyebrow">Part B · System design (HLD)</p><p class="part-title">A food delivery platform across many cities</p><p>Three apps (customer, restaurant, delivery partner) and one order passing between them. Order volume is moderate. The heavy traffic is location: hundreds of thousands of partners reporting GPS every few seconds, and customers watching them move.</p></div>
+
+  <h2 id="fd-h1">H1. Functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>In scope</th><th>Out of scope</th></tr></thead>
+    <tbody><tr><td><ul>
+      <li>Find restaurants that deliver to my location, open now, with menus and ETA</li>
+      <li>Place and pay for an order. The restaurant accepts or rejects it and marks it ready.</li>
+      <li>Assign a delivery partner automatically, with reassignment on decline or timeout</li>
+      <li>Live tracking of the partner on a map, with an updating ETA</li>
+      <li>Pickup and delivery confirmation (OTP), cancellation and refund rules, ratings</li>
+    </ul></td><td><ul>
+      <li>Partner payouts and incentives</li>
+      <li>Restaurant onboarding and menu authoring tools</li>
+      <li>Grocery, multi-restaurant orders</li>
+      <li>Routing engine internals (a maps provider)</li>
+    </ul></td></tr></tbody>
+  </table></div>
+
+  <h2 id="fd-h2">H2. Non-functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quality</th><th>Target</th><th>Why, and what it forces</th></tr></thead>
+    <tbody>
+      <tr><td>Availability</td><td>99.99% at meal peaks</td><td>Lunch and dinner are when outages cost the most. Cities are independent cells, so a failure stays local.</td></tr>
+      <tr><td>Order consistency</td><td>Strong, one owner</td><td>The order service is the only writer of order state. Every transition is a conditional update (the LLD's actor-aware table).</td></tr>
+      <tr><td>Location consistency</td><td>Eventual, seconds</td><td>A position 4 s old is fine. Location goes to a fast in-memory store, never the orders database.</td></tr>
+      <tr><td>Assignment latency</td><td>Partner assigned in &lt; 60 s, p95</td><td>Offers time out, and the dispatcher retries automatically.</td></tr>
+      <tr><td>Listing latency</td><td>p99 &lt; 300 ms</td><td>Search index plus cache. Restaurant availability (open, busy) is pushed into the index.</td></tr>
+      <tr><td>Tracking freshness</td><td>≤ 5 s on the customer map</td><td>Positions are pushed over WebSocket, not polled.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="fd-h3">H3. Capacity estimation</h2>
+  <p>Assumptions: 3M orders a day, 35% of them in a 2-hour dinner peak. 300k partners online at peak, each sending a GPS ping every 4 s. 20M DAU with 10 listing views each. An order takes 40 minutes from placement to delivery.</p>
+  <div class="table-wrap"><table class="calc">
+    <thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Orders, average</td><td>3M / 86,400</td><td class="num">~35/s</td></tr>
+      <tr><td>Orders, dinner peak</td><td>1.05M / 7,200 s ≈ 146/s · ×2 spikes</td><td class="num">~300/s</td></tr>
+      <tr><td>Order state changes</td><td>~8 transitions per order</td><td class="num">~2.4k/s peak</td></tr>
+      <tr><td>Location pings</td><td>300k ÷ 4 s</td><td class="num">75k writes/s</td></tr>
+      <tr><td>Location ingest bandwidth</td><td>75k × ~100 B</td><td class="num">~7.5 MB/s</td></tr>
+      <tr><td>Location history</td><td>~200k partners × 8 h × 900 pings/h × 100 B</td><td class="num">~144 GB/day</td></tr>
+      <tr><td>Listing reads</td><td>200M/day ≈ 2.3k/s · ×4</td><td class="num">~10k/s peak</td></tr>
+      <tr><td>Live orders (tracking sockets)</td><td>146/s × 2,400 s</td><td class="num">~350k connections</td></tr>
+      <tr><td>Tracking pushes</td><td>350k ÷ 5 s</td><td class="num">~70k messages/s</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout"><b>What the numbers tell you</b><p>Orders are a normal transactional workload (hundreds per second). Location is a streaming workload 250× bigger, and it must never touch the orders database. That split is the backbone of the design: a transactional order path and a separate in-memory, lossy, high-throughput location path.</p></div>
+
+  <h2 id="fd-h4">H4. API design</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Endpoint</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><span class="verb">GET</span> <code>/v1/restaurants?lat=&amp;lng=&amp;cuisine=&amp;cursor=</code></td><td>Only restaurants that deliver to the point and are open, with an ETA estimate</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/restaurants/{id}/menu</code></td><td>Cached. Items carry an availability flag the restaurant can toggle.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/orders</code></td><td><code>Idempotency-Key</code>. Created only after payment authorisation (see Q4). 201 PLACED.</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/orders/{id}</code> · <code>WS /v1/orders/{id}/track</code></td><td>Status, partner position, ETA. The socket sends a snapshot on connect, then deltas.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/orders/{id}/cancel</code></td><td>Refund rules depend on the state (full before acceptance, partial after preparation starts)</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/restaurant/orders/{id}/accept|reject|ready</code></td><td>Restaurant app. The actor is checked against the state table.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/partner/location</code> (or MQTT)</td><td>Batched pings <code>[{lat, lng, ts, accuracy}]</code>. Fire-and-forget, 204.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/partner/offers/{id}/accept|decline</code></td><td>409 if the offer has expired or the order has been assigned to someone else</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/partner/orders/{id}/pickup|deliver</code></td><td>Delivery requires the customer's OTP</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="fd-h5">H5. High-level design</h2>
+  <div class="diagram">{{fd-arch}}<p class="diagram-caption">Two planes. The order plane (gateway → order service → Postgres → Kafka) is transactional. The location plane (realtime gateway → location service → Redis GEO → tracking fan-out) is high-volume and is allowed to lose a ping. Dispatch joins the two.</p></div>
+  <ul>
+    <li><b>Cells by city.</b> Each city (or a group of small ones) has its own order database shard, Redis GEO and dispatch workers. Orders and partners rarely cross cities, so one city's outage doesn't spread.</li>
+    <li><b>Order plane:</b> every transition is <code>UPDATE … WHERE id AND status = expected</code>, plus an outbox row. Restaurants and partners get pushes. Notifications consume events.</li>
+    <li><b>Location plane:</b> partners keep a persistent connection. Pings are validated (speed and jump filters), written to Redis GEO with a TTL (a stale partner simply disappears), and streamed to Kafka for history and ETA training.</li>
+    <li><b>Tracking:</b> when an order has a partner, the tracking service subscribes to that partner's position channel and forwards updates to the customer's socket through the realtime gateway.</li>
+  </ul>
+  <div class="diagram">{{fd-seq}}<p class="diagram-caption">The dispatcher never writes order state directly. It asks the order service to assign, and the conditional update guarantees one partner per order.</p></div>
+
+  <h2 id="fd-h6">H6. Database design</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Data</th><th>Store</th><th>Key</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Orders, status history</td><td>Postgres, sharded by city</td><td><code>order_id</code> (city encoded in the id)</td><td>Transactions, conditional updates, reporting</td></tr>
+      <tr><td>Restaurants, menus</td><td>Postgres → Elasticsearch</td><td><code>restaurant_id</code>; geo-point and delivery polygon</td><td>Geo and text search, availability filters</td></tr>
+      <tr><td>Live partner positions</td><td>Redis GEO per city</td><td><code>geo:{city}</code> member = partnerId</td><td>75k writes/s, radius queries in milliseconds</td></tr>
+      <tr><td>Partner state</td><td>Redis hash</td><td><code>partner:{id}</code> {status, orderId, lastSeen}</td><td>Atomic status changes with Lua or <code>SET NX</code></td></tr>
+      <tr><td>Location history</td><td>Kafka → S3 (Parquet)</td><td>date / city / partner</td><td>Cheap, used for disputes, analytics, ETA models</td></tr>
+    </tbody>
+  </table></div>
+  <div class="code" data-src="sql"><div class="code-head"><span>orders</span><button type="button" data-copy>Copy</button></div><script type="text/plain">CREATE TABLE orders (
+  id uuid PRIMARY KEY, city_id int NOT NULL, customer_id uuid, restaurant_id uuid, partner_id uuid,
+  status text NOT NULL,                  -- PLACED | ACCEPTED | PREPARING | READY | PICKED_UP | DELIVERED | CANCELLED
+  version int NOT NULL DEFAULT 0,
+  drop_lat double precision, drop_lng double precision,
+  items jsonb NOT NULL, total_paise bigint, delivery_fee_paise bigint,
+  promised_at timestamptz, created_at timestamptz DEFAULT now()
+);
+CREATE INDEX orders_active_by_restaurant ON orders (restaurant_id, created_at) WHERE status IN ('PLACED','ACCEPTED','PREPARING','READY');
+CREATE INDEX orders_waiting_partner ON orders (city_id, created_at) WHERE status IN ('ACCEPTED','PREPARING','READY') AND partner_id IS NULL;
+CREATE TABLE order_events (order_id uuid, seq int, status text, actor text, actor_id uuid, at timestamptz,
+                           PRIMARY KEY (order_id, seq));      -- audit + "where is my order" timeline</script></div>
+
+  <h2 id="fd-h7">H7. Detailed component design</h2>
+  <h3>1 · Location ingestion</h3>
+  <ul>
+    <li>Partners send batched pings over a persistent connection (MQTT or WebSocket). That's cheaper on battery and bandwidth than an HTTP request every 4 s.</li>
+    <li>The location service drops implausible points (a jump of 2 km in 4 s) and writes <code>GEOADD geo:{city} lng lat partnerId</code> and <code>HSET partner:{id} lastSeen …</code>. A sweeper runs <code>ZREM</code> on partners not seen for 30 s.</li>
+    <li>75k writes a second across around 20 city shards is ~4k/s per Redis, which is easy. Pings also go to Kafka (partitioned by partner) for history.</li>
+    <li>The alternative is H3 or geohash cells (<code>cell → set of partners</code>), which let you query neighbouring cells at fixed resolutions and shard by cell. Redis GEO uses geohash internally anyway.</li>
+  </ul>
+  <h3>2 · Dispatch</h3>
+  <ul>
+    <li><b>Trigger:</b> <code>OrderAccepted</code>, timed so the partner arrives as the food is ready: start searching at about <code>prepTime − travelTime</code>.</li>
+    <li><b>Candidates:</b> <code>GEOSEARCH</code> within 3 km, filtered to <code>status = FREE</code>. Score each by travel ETA (from the ETA service), how well its arrival matches the ready time, and fairness (time since the partner's last order).</li>
+    <li><b>Batching:</b> dispatch collects orders for 10–30 s and solves the assignment for the whole batch (minimum total cost, for example the Hungarian algorithm) instead of greedily one at a time. That's F2 in the LLD.</li>
+    <li><b>No double offers:</b> <code>SET partner:{id}:offer orderId NX PX 30000</code> before offering. Only one dispatcher can hold a partner, and the key expires on its own if the partner ignores the offer.</li>
+    <li><b>Accept:</b> the order service runs <code>UPDATE orders SET partner_id = $p, version = version + 1 WHERE id = $o AND partner_id IS NULL</code>. If 0 rows change, someone else won, and the partner is released.</li>
+  </ul>
+  <h3>3 · Waiting queue and reassignment</h3>
+  <p>An order with no candidates stays in a per-city queue (the <code>orders_waiting_partner</code> index), and dispatch retries it every 10 s with a wider radius and a bonus incentive. This is the LLD's <code>dispatchWaiting</code>, run on a schedule. A partner who goes offline mid-order triggers reassignment from the current position of the food (at the restaurant, or with the partner, which needs ops to step in).</p>
+  <h3>4 · Live tracking fan-out</h3>
+  <ul>
+    <li>When an order has a partner, the tracking service subscribes to <code>loc:{partnerId}</code> (Redis pub/sub, published by the location service). Each update is forwarded to the order's channel at the realtime gateway, which pushes it to the customer's socket.</li>
+    <li>Throttle to one update every 5 s per order, and send the ETA only when it changes by more than a minute.</li>
+    <li>350k sockets need ~10–20 gateway nodes with sticky routing. A node failure means clients reconnect and get a fresh snapshot.</li>
+  </ul>
+
+  <h2 id="fd-h8">H8. Interviewer questions and counters</h2>
+  <details class="qa"><summary><span class="qn">Q1</span>Why Redis GEO and not PostGIS?</summary><div class="qa-body">
+    <h4>Answer</h4><p>75k position updates a second is a write rate that would fill a relational database with dead rows, and the data is only valuable for seconds. Redis keeps the latest position in memory, and radius queries take milliseconds. PostGIS is the right tool for the durable shapes: restaurant delivery zones and city polygons.</p>
+    <h4 class="change">Push-back: "Redis dies, and you've lost every partner's location."</h4><p>For about 4 seconds: the next round of pings rebuilds it. That's exactly why this data can live in a store that doesn't need to be durable. Run it with a replica for faster failover. Dispatch pauses briefly, and the order data is untouched.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q2</span>How do you stop one partner being assigned two orders at once?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Two guards. A short-lived offer lock per partner (<code>SET NX PX</code>) stops two dispatchers offering the same partner. A conditional update on the order (<code>WHERE partner_id IS NULL</code>) stops two partners taking the same order. Stacking orders (two orders from one restaurant on one trip) is a deliberate batching decision, not an accident.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q3</span>Nearest partner first is simple. Why do anything more complex?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Nearest-first per order is locally optimal and globally poor. It sends the only nearby partner to order A when order B, next door, had nobody else. Batching orders over a short window and minimising total pickup time does measurably better. Also, the "nearest" partner is useless if the food won't be ready for 20 minutes: what matters is arriving close to the ready time.</p>
+    <h4 class="change">Push-back: "Batching adds 20 s of delay."</h4><p>Food takes 15 minutes to prepare, so 20 seconds of dispatch delay is invisible. Start dispatch based on prep time, and batch when the window allows.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q4</span>When do you charge the customer?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Authorise (or take payment) before the order reaches the restaurant, so the kitchen never cooks an unpaid order. If the restaurant rejects or nobody can deliver, refund or void the authorisation automatically. Cash on delivery skips the step, and those orders need risk limits per customer. F5 in the LLD has the state details.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q5</span>WebSocket or polling for tracking?</summary><div class="qa-body">
+    <h4>Answer</h4><p>WebSocket, or SSE: one connection per live order, pushed every 5 s. Polling every 5 s from 350k clients is 70k requests a second, with each one doing authentication and routing. Push costs memory per connection, but almost no CPU between messages. Keep polling as the fallback for networks that block WebSockets.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q6</span>The restaurant doesn't respond to a new order.</summary><div class="qa-body">
+    <h4>Answer</h4><p>Escalate on timers: push again at 60 s, an automated phone call at 2 minutes, auto-cancel and refund at 5 minutes, and mark the restaurant "busy" so it stops getting orders. These timers are scheduled jobs keyed by order id (the job scheduler from Part 1), and each one runs only if the order is still PLACED. The conditional update guarantees that.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q7</span>Why partition by city? What about orders near city borders?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Almost every order, restaurant and partner belongs to one city, so a city is a natural failure and scaling boundary. Border areas get assigned to one city's cell. A partner who crosses over moves cell when their status is FREE. Global things (user accounts, payments, restaurant catalogue) live outside the cells.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q8</span>GPS is noisy: the partner jumps around the map, and ETA flips between 5 and 15 minutes.</summary><div class="qa-body">
+    <h4>Answer</h4><p>Filter on ingest (drop impossible speeds, weight by reported accuracy), snap to the road network for display, and smooth ETA with hysteresis: only show a change above a threshold that persists for two updates. Positions shown to the customer are presentation, so smoothing them is fine. Dispatch uses the raw latest point.</p>
+  </div></details>

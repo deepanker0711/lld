@@ -1,0 +1,97 @@
+# VS Code REST Client: run top to bottom. Tokens are captured from responses.
+@base = http://localhost:3000
+
+### 1. Register -> 201 (no passwordHash in the response)
+POST {{base}}/auth/register
+Content-Type: application/json
+
+{ "email": "Asha@Example.com", "name": "Asha", "password": "secret123" }
+
+### 2. Same email again (any case) -> 409
+POST {{base}}/auth/register
+Content-Type: application/json
+
+{ "email": "asha@example.com", "name": "Asha 2", "password": "secret123" }
+
+### 3. Weak password -> 400
+POST {{base}}/auth/register
+Content-Type: application/json
+
+{ "email": "weak@example.com", "name": "Weak", "password": "short" }
+
+### 4. Admin (admin@example.com gets ADMIN)
+POST {{base}}/auth/register
+Content-Type: application/json
+
+{ "email": "admin@example.com", "name": "Admin", "password": "admin1234" }
+
+### 5. Login -> 200 { accessToken, refreshToken, expiresIn: 900 }
+# @name login
+POST {{base}}/auth/login
+Content-Type: application/json
+
+{ "email": "asha@example.com", "password": "secret123" }
+
+### 6. Wrong password -> 401 "Invalid email or password" (same as unknown email). 5 in a row -> 429 lockout
+POST {{base}}/auth/login
+Content-Type: application/json
+
+{ "email": "asha@example.com", "password": "wrong1234" }
+
+### 7. Me (Bearer) -> 200
+GET {{base}}/auth/me
+Authorization: Bearer {{login.response.body.data.accessToken}}
+
+### 8. No token -> 401
+GET {{base}}/auth/me
+
+### 9. Not an admin -> 403
+GET {{base}}/auth/admin/users
+Authorization: Bearer {{login.response.body.data.accessToken}}
+
+### 10. My sessions (devices)
+GET {{base}}/auth/sessions
+Authorization: Bearer {{login.response.body.data.accessToken}}
+
+### 11. Refresh -> new pair (old refresh token is now used up)
+# @name refreshed
+POST {{base}}/auth/refresh
+Content-Type: application/json
+
+{ "refreshToken": "{{login.response.body.data.refreshToken}}" }
+
+### 12. Replay the OLD refresh token -> 401 reuse detected; the whole session is revoked
+POST {{base}}/auth/refresh
+Content-Type: application/json
+
+{ "refreshToken": "{{login.response.body.data.refreshToken}}" }
+
+### 13. The new access token is dead too -> 401
+GET {{base}}/auth/me
+Authorization: Bearer {{refreshed.response.body.data.accessToken}}
+
+### 14. Fresh login, then logout -> the token stops working immediately
+# @name login2
+POST {{base}}/auth/login
+Content-Type: application/json
+
+{ "email": "asha@example.com", "password": "secret123" }
+
+###
+POST {{base}}/auth/logout
+Authorization: Bearer {{login2.response.body.data.accessToken}}
+
+###
+GET {{base}}/auth/me
+Authorization: Bearer {{login2.response.body.data.accessToken}}
+
+### 15. Admin lists users
+# @name adminLogin
+POST {{base}}/auth/login
+Content-Type: application/json
+
+{ "email": "admin@example.com", "password": "admin1234" }
+
+###
+GET {{base}}/auth/admin/users
+Authorization: Bearer {{adminLogin.response.body.data.accessToken}}

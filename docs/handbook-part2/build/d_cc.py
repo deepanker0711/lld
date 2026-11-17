@@ -1,0 +1,60 @@
+from diag import arch, seq, B, L
+
+D = {}
+
+D['cc-arch'] = arch('cc-arch', 860, 560, [
+    B('cl', 10, 220, 100, 60, 'Clients', 'web · app', 'client'),
+    B('gw', 140, 220, 110, 60, 'API gateway', 'auth · rate limit', 'edge'),
+    B('cart', 300, 30, 150, 64, 'Cart service', 'add · update · coupon'),
+    B('cat', 300, 125, 150, 64, 'Catalog + pricing', 'prices · promotions'),
+    B('chk', 300, 230, 150, 84, 'Checkout / orders', 'saga orchestrator\nidempotency keys\norder state machine'),
+    B('inv', 300, 355, 150, 64, 'Inventory service', 'reserve · commit · release'),
+    B('pay', 300, 455, 150, 64, 'Payment service', 'intents · webhooks'),
+    B('cdb', 520, 30, 150, 64, 'Cart store', 'KV by user_id\n(Redis in front)', 'store'),
+    B('pc', 520, 125, 150, 64, 'Price cache', 'Redis · 60 s TTL', 'cache'),
+    B('odb', 520, 230, 150, 84, 'Orders DB', 'Postgres by user_id\norders · outbox\nidempotency_keys', 'store'),
+    B('idb', 520, 355, 150, 64, 'Inventory DB', 'Postgres by sku\nstock · reservations', 'store'),
+    B('kf', 720, 230, 130, 84, 'Kafka', 'OrderPlaced\nPaymentSucceeded\nOrderConfirmed', 'queue'),
+    B('co', 720, 355, 130, 64, 'Consumers', 'fulfilment · email\nanalytics · search', 'svc'),
+    B('psp', 720, 455, 130, 64, 'PSP', 'UPI · cards · 3DS', 'ext'),
+], [
+    L('cl', 'gw', ''),
+    L('gw', 'cart', '', oa=-20, mx=275),
+    L('gw', 'chk', 'POST /v1/checkout', oa=22, ob=0, lp=(196, 298)),
+    L('cart', 'cdb', ''),
+    L('cart', 'cat', 'live prices', sides=('b', 't')),
+    L('cat', 'pc', ''),
+    L('chk', 'cat', 'cart + quote', sides=('t', 'b')),
+    L('chk', 'odb', '1 txn'),
+    L('chk', 'inv', 'reserve / commit / release', sides=('b', 't')),
+    L('inv', 'idb', ''),
+    L('chk', 'pay', 'create intent', sides=('l', 'l'), oa=28, mx=282, lp=(240, 420)),
+    L('pay', 'psp', 'intent · webhook', both=True, oa=10, ob=0),
+    L('odb', 'kf', 'relay', k='async'),
+    L('kf', 'co', '', k='async', sides=('b', 't')),
+    L('pay', 'kf', 'PaymentSucceeded', k='async', oa=-18, ob=30, mx=696, lp=(595, 469)),
+], title='Cart and checkout: high-level architecture')
+
+D['cc-seq'] = seq('cc-seq', [
+    ('c', 'Client'), ('o', 'Checkout'), ('i', 'Inventory'), ('p', 'Payment'), ('s', 'PSP'), ('k', 'Kafka'),
+], [
+    ('m', 'c', 'o', 'POST /checkout + key'),
+    ('self', 'o', 'claim idempotency key; quote'),
+    ('m', 'o', 'i', 'reserve, TTL 15m'),
+    ('r', 'i', 'o', 'reservationId'),
+    ('self', 'o', 'order PENDING_PAYMENT + outbox'),
+    ('m', 'o', 'p', 'create intent (key = orderId)'),
+    ('m', 'p', 's', 'create PSP order'),
+    ('r', 'p', 'o', 'intent + client secret'),
+    ('r', 'o', 'c', '201 order + payment action'),
+    ('sep', 'USER PAYS ON THE PSP SCREEN (UPI / 3DS)'),
+    ('m', 'c', 's', 'authorise payment'),
+    ('a', 's', 'p', 'webhook: captured'),
+    ('a', 'p', 'k', 'PaymentSucceeded'),
+    ('a', 'k', 'o', 'consume (idempotent)'),
+    ('m', 'o', 'i', 'commit reservation'),
+    ('self', 'o', 'order CONFIRMED + outbox'),
+    ('a', 'o', 'k', 'OrderConfirmed → fulfilment, email'),
+    ('sep', 'DECLINED, ABANDONED OR WEBHOOK LOST'),
+    ('note', 'o', 's', 'Reconciler: PENDING_PAYMENT older than 15 min → ask the PSP.\nCaptured → confirm as above. Failed or expired → release reservation, PAYMENT_FAILED.'),
+], title='Checkout saga')

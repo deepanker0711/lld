@@ -1,0 +1,50 @@
+# Seeded rules: default = TOKEN_BUCKET 5 per 10s, search = SLIDING_WINDOW_LOG 3 per 10s.
+# Fastest demo from a terminal:
+#   for i in {1..7}; do curl -s -o /dev/null -w "%{http_code} " -H 'x-client-id: alice' localhost:3000/limited/ping; done
+#   -> 200 200 200 200 200 429 429
+@base = http://localhost:3000
+
+### Rules
+GET {{base}}/rate-limits/rules
+
+### Ping as alice (send 6 times quickly -> 6th is 429; see X-RateLimit-* and Retry-After headers)
+GET {{base}}/limited/ping
+x-client-id: alice
+
+### Ping as bob -> own bucket, still 200
+GET {{base}}/limited/ping
+x-client-id: bob
+
+### Search uses the 'search' rule (3 per 10s, sliding window)
+GET {{base}}/limited/search?q=keka
+x-client-id: alice
+
+### Alice's allowance without spending it
+GET {{base}}/rate-limits/usage/alice?rule=default
+
+### Tighten the default rule (resets all buckets for it)
+PATCH {{base}}/rate-limits/rules/default
+Content-Type: application/json
+
+{ "limit": 2, "windowMs": 5000 }
+
+### New rule
+POST {{base}}/rate-limits/rules
+Content-Type: application/json
+
+{ "key": "login", "algorithm": "SLIDING_WINDOW_LOG", "limit": 5, "windowMs": 60000 }
+
+### Duplicate -> 409
+POST {{base}}/rate-limits/rules
+Content-Type: application/json
+
+{ "key": "login", "algorithm": "TOKEN_BUCKET", "limit": 5, "windowMs": 60000 }
+
+### Validation -> 400
+POST {{base}}/rate-limits/rules
+Content-Type: application/json
+
+{ "key": "BAD KEY", "algorithm": "MAGIC", "limit": 0, "windowMs": 1 }
+
+### Delete
+DELETE {{base}}/rate-limits/rules/login

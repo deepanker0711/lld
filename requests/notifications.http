@@ -1,0 +1,90 @@
+# VS Code REST Client: click "Send Request" on each block, top to bottom.
+# Fake providers fail deterministically by recipient text:
+#   "flaky" → fails the first try only    "fail" → always fails (transient)    "bounce" → permanent failure
+# Optional: NOTIFY_FAIL_RATE=0.3 npm run start:dev  → 30% random failures on top.
+# Watch the server terminal: senders log each message, the dispatcher logs retries.
+@base = http://localhost:3000
+
+### 1. Templates: an EMAIL variant (needs a subject) ...
+POST {{base}}/templates
+Content-Type: application/json
+
+{ "key": "leave_approved", "channel": "EMAIL", "subject": "Leave approved", "body": "Hi {{name}}, your leave from {{from}} is approved" }
+
+### 2. ... and a default, used by SMS and PUSH
+POST {{base}}/templates
+Content-Type: application/json
+
+{ "key": "leave_approved", "body": "Leave from {{from}} approved" }
+
+### 3. User with email only (no phone)
+# @name asha
+POST {{base}}/users
+Content-Type: application/json
+
+{ "name": "Asha", "email": "asha@x.com" }
+
+### 4. Send on EMAIL + SMS → 202, both PENDING (nothing sent yet)
+# @name n1
+POST {{base}}/notifications
+Content-Type: application/json
+
+{ "userId": "{{asha.response.body.data.id}}", "templateKey": "leave_approved", "channels": ["EMAIL", "SMS"], "data": { "name": "Asha", "from": "1 Nov" } }
+
+### 5. A moment later → PARTIAL: EMAIL SENT, SMS FAILED "No recipient"
+GET {{base}}/notifications/{{n1.response.body.data.id}}
+
+### 6. Missing variable → 400 "Missing template variables: from" (nothing stored)
+POST {{base}}/notifications
+Content-Type: application/json
+
+{ "userId": "{{asha.response.body.data.id}}", "templateKey": "leave_approved", "channels": ["EMAIL"], "data": { "name": "Asha" } }
+
+### 7. Flaky user: first try times out, retry 1s later succeeds
+# @name flaky
+POST {{base}}/users
+Content-Type: application/json
+
+{ "name": "Ravi", "email": "flaky@x.com" }
+
+### 8. Send → 202
+# @name n2
+POST {{base}}/notifications
+Content-Type: application/json
+
+{ "userId": "{{flaky.response.body.data.id}}", "templateKey": "leave_approved", "channels": ["EMAIL"], "data": { "name": "Ravi", "from": "3 Nov" } }
+
+### 9. Right away: PENDING, attempts 1, lastError "timeout", nextAttemptAt ~1s ahead. After 1s: SENT, attempts 2
+GET {{base}}/notifications/{{n2.response.body.data.id}}
+
+### 10. Failing user: retries at +1s and +2s, FAILED after 3 attempts (~3s)
+# @name failing
+POST {{base}}/users
+Content-Type: application/json
+
+{ "name": "Meera", "email": "fail@x.com" }
+
+### 11. Send → 202
+# @name n3
+POST {{base}}/notifications
+Content-Type: application/json
+
+{ "userId": "{{failing.response.body.data.id}}", "templateKey": "leave_approved", "channels": ["EMAIL"], "data": { "name": "Meera", "from": "5 Nov" } }
+
+### 12. Re-run a few times over ~3s: attempts 1 → 2 → 3, then FAILED
+GET {{base}}/notifications/{{n3.response.body.data.id}}
+
+### 13. Opt Asha out of EMAIL
+PUT {{base}}/users/{{asha.response.body.data.id}}/preferences
+Content-Type: application/json
+
+{ "channels": { "EMAIL": false } }
+
+### 14. EMAIL only, now opted out → 422 "All requested channels are opted out"
+POST {{base}}/notifications
+Content-Type: application/json
+
+{ "userId": "{{asha.response.body.data.id}}", "templateKey": "leave_approved", "channels": ["EMAIL"], "data": { "name": "Asha", "from": "1 Nov" } }
+
+### 15. Asha's history, newest first
+GET {{base}}/users/{{asha.response.body.data.id}}/notifications?page=1&limit=10

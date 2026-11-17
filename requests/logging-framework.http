@@ -1,0 +1,50 @@
+@base = http://localhost:3000
+
+### 1. Loggers and their effective levels (root INFO, app INFO)
+GET {{base}}/logging/loggers
+
+### 2. DEBUG on app.orders while it's INFO -> written: false (one comparison, nothing built)
+POST {{base}}/logging/logs
+Content-Type: application/json
+
+{ "logger": "app.orders", "level": "DEBUG", "message": "cart validated", "fields": { "lines": 3 } }
+
+### 3. Turn DEBUG on for app.orders at runtime (children inherit)
+PUT {{base}}/logging/loggers/app.orders/level
+Content-Type: application/json
+
+{ "level": "DEBUG" }
+
+### 4. Now it's written
+POST {{base}}/logging/logs
+Content-Type: application/json
+
+{ "logger": "app.orders.cart", "level": "DEBUG", "message": "cart validated", "fields": { "lines": 3 } }
+
+### 5. Secrets in fields are redacted
+POST {{base}}/logging/logs
+Content-Type: application/json
+
+{ "logger": "app.payment", "level": "INFO", "message": "charging", "fields": { "amountPaise": 177000, "cardNumber": "4111111111111111" } }
+
+### 6. Demo request flow: same requestId on every line, across awaits, without passing it
+POST {{base}}/logging/demo/checkout
+Content-Type: application/json
+x-request-id: req-demo-1
+
+{ "fail": true }
+
+### 7. Query the in-memory ring buffer
+GET {{base}}/logging/entries?requestId=req-demo-1
+
+###
+GET {{base}}/logging/entries?level=ERROR
+
+### 8. Back to inheriting
+PUT {{base}}/logging/loggers/app.orders/level
+Content-Type: application/json
+
+{ "level": null }
+
+### 9. Stats: lines per level, appender errors, dropped
+GET {{base}}/logging/stats

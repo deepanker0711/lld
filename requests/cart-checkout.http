@@ -1,0 +1,88 @@
+@base = http://localhost:3000
+
+### 1. Products (prices in paise: 49900 = ₹499)
+# @name phone
+POST {{base}}/products
+Content-Type: application/json
+
+{ "sku": "PHONE-1", "name": "Phone", "pricePaise": 1000000, "stock": 1 }
+
+###
+# @name tee
+POST {{base}}/products
+Content-Type: application/json
+
+{ "sku": "tee-1", "name": "T-shirt", "pricePaise": 49900, "stock": 50 }
+
+### 2. Coupon: 20% off up to ₹200 on ₹500+
+POST {{base}}/coupons
+Content-Type: application/json
+
+{ "code": "save20", "kind": "PERCENT", "value": 20, "minSubtotalPaise": 50000, "maxDiscountPaise": 20000 }
+
+### 3. Add to cart (repeat adds merge)
+POST {{base}}/carts/u1/items
+Content-Type: application/json
+
+{ "productId": "{{tee.response.body.data.id}}", "qty": 2 }
+
+### 4. More than in stock -> 409 { requested, available }
+POST {{base}}/carts/u1/items
+Content-Type: application/json
+
+{ "productId": "{{phone.response.body.data.id}}", "qty": 2 }
+
+### 5. Apply coupon -> totals: subtotal, discount (capped), 18% tax, total
+PUT {{base}}/carts/u1/coupon
+Content-Type: application/json
+
+{ "code": "SAVE20" }
+
+### 6. View cart (priced live)
+GET {{base}}/carts/u1
+
+### 7. Checkout without Idempotency-Key -> 400
+POST {{base}}/carts/u1/checkout
+Content-Type: application/json
+
+{ "paymentToken": "tok_ok" }
+
+### 8. Checkout -> 201 CONFIRMED, cart cleared, stock committed
+# @name order
+POST {{base}}/carts/u1/checkout
+Content-Type: application/json
+Idempotency-Key: checkout-u1-0001
+
+{ "paymentToken": "tok_ok" }
+
+### 9. Same key again -> 200 + Idempotent-Replayed: true, same order, no second charge
+POST {{base}}/carts/u1/checkout
+Content-Type: application/json
+Idempotency-Key: checkout-u1-0001
+
+{ "paymentToken": "tok_ok" }
+
+### 10. Declined card -> 422, stock released, cart kept
+POST {{base}}/carts/u2/items
+Content-Type: application/json
+
+{ "productId": "{{phone.response.body.data.id}}", "qty": 1 }
+
+###
+POST {{base}}/carts/u2/checkout
+Content-Type: application/json
+Idempotency-Key: checkout-u2-0001
+
+{ "paymentToken": "tok_decline" }
+
+###
+GET {{base}}/carts/u2
+
+### 11. Orders
+GET {{base}}/orders?userId=u1
+
+### 12. Cancel -> refund + restock; again -> 409; someone else -> 403
+POST {{base}}/orders/{{order.response.body.data.id}}/cancel
+Content-Type: application/json
+
+{ "userId": "u1" }

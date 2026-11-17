@@ -1,0 +1,178 @@
+  <div class="part-banner" id="wl-hld"><p class="eyebrow">Part B · System design (HLD)</p><p class="part-title">A prepaid wallet holding real money</p><p>Correctness beats everything else: money is never created or destroyed, and every rupee can be traced. The hard parts are external rails that time out without saying what happened, hot merchant accounts, and transfers between users whose accounts sit on different shards.</p></div>
+
+  <h2 id="wl-h1">H1. Functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>In scope</th><th>Out of scope</th></tr></thead>
+    <tbody><tr><td><ul>
+      <li>Open a wallet. KYC tier decides the limits.</li>
+      <li>Top up from UPI or a card. Withdraw to a bank account.</li>
+      <li>Pay another user (P2P) or a merchant, with fees and cashback</li>
+      <li>Balance, statement with pagination, transaction status</li>
+      <li>Per-transaction, daily and maximum-balance limits; freezing accounts</li>
+      <li>Refunds and reversals; daily reconciliation with every payment rail</li>
+    </ul></td><td><ul>
+      <li>KYC verification itself (a vendor integration)</li>
+      <li>Credit and lending</li>
+      <li>Multi-currency (FX conversion is a follow-up)</li>
+      <li>Merchant onboarding and settlement payouts in detail</li>
+    </ul></td></tr></tbody>
+  </table></div>
+
+  <h2 id="wl-h2">H2. Non-functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quality</th><th>Target</th><th>Why, and what it forces</th></tr></thead>
+    <tbody>
+      <tr><td>Correctness</td><td>Ledger always balances</td><td>Double entry. Every movement is a debit and a matching credit in one database transaction. Checked continuously.</td></tr>
+      <tr><td>Durability</td><td>RPO 0 · RTO &lt; 5 min</td><td>Synchronous replica in a second availability zone, and failover that has been rehearsed. An acknowledged transfer must survive losing a node.</td></tr>
+      <tr><td>Consistency</td><td>Strong, per account</td><td>A balance read after a transfer must include it. Accounts are never written in two regions at once.</td></tr>
+      <tr><td>Idempotency</td><td>Every mutating call</td><td>Mobile networks retry. A transfer retried after a timeout must not move money twice.</td></tr>
+      <tr><td>Availability</td><td>99.99% for transfers</td><td>About 4 minutes of downtime a month. Top-ups and payouts depend on external rails and are allowed to show "pending".</td></tr>
+      <tr><td>Latency</td><td>P2P p99 &lt; 500 ms</td><td>Short transactions, no external calls inside a database transaction.</td></tr>
+      <tr><td>Audit</td><td>Immutable, 10 years</td><td>The ledger is append-only and corrections are new entries. Required by regulators.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="wl-h3">H3. Capacity estimation</h2>
+  <p>Assumptions: 50M wallets, 10M DAU, 20M transactions a day, 2 ledger entries per transaction on average (fees add more), 5 balance or statement reads per DAU. Peak is 5×, and festival spikes reach about 3k transactions a second.</p>
+  <div class="table-wrap"><table class="calc">
+    <thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Transactions</td><td>20M/day ≈ 231/s · ×5</td><td class="num">~1.2k/s peak (3k festival)</td></tr>
+      <tr><td>Ledger entry writes</td><td>×2 entries</td><td class="num">~2.4k/s peak (6k festival)</td></tr>
+      <tr><td>Balance and statement reads</td><td>50M/day ≈ 580/s · ×5</td><td class="num">~3k/s peak</td></tr>
+      <tr><td>Ledger growth</td><td>40M entries × 200 B</td><td class="num">8 GB/day ≈ 3 TB/year</td></tr>
+      <tr><td>10-year retention</td><td>3 TB × 10</td><td class="num">~30 TB, mostly cold</td></tr>
+      <tr><td>Accounts table</td><td>50M × 200 B</td><td class="num">~10 GB</td></tr>
+      <tr><td>Idempotency keys (7 days)</td><td>20M × 200 B × 7</td><td class="num">~28 GB</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout"><b>What the numbers tell you</b><p>A few thousand writes a second fits one well-sized Postgres primary. Shard because of storage growth, blast radius and hot accounts, not raw throughput, and do it by account id. Statements are a read model so they never compete with posting.</p></div>
+
+  <h2 id="wl-h4">H4. API design</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Endpoint</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><span class="verb">POST</span> <code>/v1/wallets</code></td><td>One per user per currency. 409 if it already exists.</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/wallets/{id}</code></td><td>Balance, limits remaining today, status. Always read from the primary.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/wallets/{id}/topups</code></td><td><code>Idempotency-Key</code>. 201 <code>{txnId, status: PENDING, payment action}</code>. Completes when the PSP webhook arrives.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/transfers</code></td><td><code>Idempotency-Key</code>, <code>{from, to, amountPaise, note}</code>. 201 SUCCEEDED · 422 insufficient funds or over a limit · 423 frozen. A replay returns the original response.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/wallets/{id}/withdrawals</code></td><td>202 PENDING. Status is sent by push and available via <code>GET /v1/transactions/{id}</code>.</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/wallets/{id}/statement?cursor=&amp;from=&amp;to=</code></td><td>Served from the statement read model, cursor on <code>(posted_at, entry_id)</code></td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/psp/webhooks</code></td><td>Signature-checked, deduplicated on event id</td></tr>
+    </tbody>
+  </table></div>
+  <p>Amounts are integers in paise, never floats. Responses echo <code>txnId</code> and a <code>status</code> from a closed set, so clients can render "pending" truthfully.</p>
+
+  <h2 id="wl-h5">H5. High-level design</h2>
+  <div class="diagram">{{wl-arch}}<p class="diagram-caption">The ledger service is the only code that can change a balance. Everything else (risk, the external rails, statements) sits around it and talks to it through posting requests or events.</p></div>
+  <ul>
+    <li><b>Internal movement</b> (P2P, merchant payment, fees, cashback) is synchronous: idempotency claim → risk and limits → one ledger posting → response.</li>
+    <li><b>External movement</b> (top-up, payout) is a state machine in the money-movement service. The ledger records the internal side through a <b>clearing account</b> (for example "payouts in flight"), so money that is between us and the bank is always visible and balanced.</li>
+    <li><b>Reads:</b> balances come from the account row on the primary. Statements come from a read model (Cassandra or a Postgres replica) built from <code>TxnPosted</code> events.</li>
+    <li><b>Reconciliation</b> compares each rail's settlement file with the ledger every day. Any break (in the file but not in our ledger, or the other way round) opens a ticket.</li>
+  </ul>
+  <div class="diagram">{{wl-seq}}<p class="diagram-caption">The rule senior interviewers look for: a timeout is not a failure. Reversing a payout that actually succeeded gives money away.</p></div>
+
+  <h2 id="wl-h6">H6. Database design</h2>
+  <p><b>Choice: Postgres</b> (or a distributed SQL database once you need cross-shard transactions). Posting needs multi-row ACID, check constraints and row locks. A ledger is relational and append-mostly, which is exactly what these databases are good at.</p>
+  <div class="code" data-src="sql"><div class="code-head"><span>schema</span><button type="button" data-copy>Copy</button></div><script type="text/plain">CREATE TABLE accounts (
+  id uuid PRIMARY KEY, owner_id uuid, type text NOT NULL,      -- USER | MERCHANT | SYSTEM (fees, clearing, cashback)
+  currency char(3) NOT NULL DEFAULT 'INR', status text NOT NULL, -- ACTIVE | FROZEN | CLOSED
+  kyc_tier text, balance_paise bigint NOT NULL DEFAULT 0,
+  allow_negative boolean NOT NULL DEFAULT false,
+  CHECK (allow_negative OR balance_paise >= 0)
+);
+CREATE TABLE transactions (
+  id uuid PRIMARY KEY, kind text NOT NULL,                     -- TOPUP | P2P | MERCHANT | PAYOUT | REVERSAL | FEE
+  status text NOT NULL, amount_paise bigint NOT NULL CHECK (amount_paise > 0),
+  initiator uuid, external_ref text UNIQUE, reverses uuid REFERENCES transactions,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE ledger_entries (                                  -- append-only: no UPDATE, no DELETE (enforced by grants)
+  id bigint GENERATED ALWAYS AS IDENTITY, txn_id uuid NOT NULL, account_id uuid NOT NULL,
+  direction char(1) NOT NULL CHECK (direction IN ('D','C')), amount_paise bigint NOT NULL CHECK (amount_paise > 0),
+  balance_after bigint NOT NULL, posted_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (posted_at, id)
+) PARTITION BY RANGE (posted_at);                              -- monthly; old partitions → cold storage
+CREATE INDEX entries_by_account ON ledger_entries (account_id, posted_at DESC, id);
+CREATE TABLE idempotency_keys (
+  scope uuid, key text, fingerprint bytea NOT NULL, status text NOT NULL,   -- IN_PROGRESS | DONE
+  txn_id uuid, response jsonb, created_at timestamptz, PRIMARY KEY (scope, key)
+);
+CREATE TABLE daily_usage (account_id uuid, day date, outgoing_paise bigint NOT NULL DEFAULT 0,
+                          PRIMARY KEY (account_id, day));</script></div>
+  <ul>
+    <li><code>balance_after</code> on each entry makes statements and audits cheap, and lets you check any account at any point in time.</li>
+    <li>System accounts (clearing, fees) have <code>allow_negative</code> where it makes sense. "External world" is not an account with a balance row, so it never becomes a hot row.</li>
+    <li>The daily limit is a row updated in the same transaction (<code>… SET outgoing = outgoing + $amt WHERE outgoing + $amt &lt;= $limit</code>), so two parallel transfers can't both slip under it.</li>
+  </ul>
+
+  <h2 id="wl-h7">H7. Detailed component design</h2>
+  <h3>1 · The posting engine</h3>
+  <div class="code" data-src="sql"><div class="code-head"><span>post(txn, from, to, amount): one transaction</span><button type="button" data-copy>Copy</button></div><script type="text/plain">BEGIN;  -- READ COMMITTED is enough: correctness comes from row locks + constraints
+SELECT id, balance_paise, status FROM accounts
+ WHERE id IN ($from, $to) ORDER BY id FOR UPDATE;       -- fixed lock order → no deadlocks
+-- app: both ACTIVE? from.balance >= amount? (the CHECK constraint is the backstop)
+UPDATE daily_usage SET outgoing_paise = outgoing_paise + $amt
+ WHERE account_id = $from AND day = $ist_day AND outgoing_paise + $amt <= $limit;   -- 0 rows → 422
+UPDATE accounts SET balance_paise = balance_paise - $amt WHERE id = $from RETURNING balance_paise;
+UPDATE accounts SET balance_paise = balance_paise + $amt WHERE id = $to   RETURNING balance_paise;
+INSERT INTO ledger_entries (txn_id, account_id, direction, amount_paise, balance_after) VALUES
+  ($txn, $from, 'D', $amt, $fromAfter), ($txn, $to, 'C', $amt, $toAfter);
+UPDATE transactions SET status = 'SUCCEEDED' WHERE id = $txn;
+UPDATE idempotency_keys SET status = 'DONE', response = $resp WHERE scope = $from AND key = $key;
+INSERT INTO outbox (...) VALUES ('TxnPosted', ...);
+COMMIT;</script></div>
+  <h3>2 · Idempotency that survives concurrency</h3>
+  <ul>
+    <li>Claim first: <code>INSERT … (status IN_PROGRESS, fingerprint)</code>. A unique violation means the key has been seen before. If it's DONE with the same fingerprint, return the stored response. With a different fingerprint, 422. If it's still IN_PROGRESS, 409 "retry shortly".</li>
+    <li>For internal transfers the claim and the posting are in the same transaction, so a crash leaves nothing behind. For external legs the key row points at the transaction, and a retry returns its current status instead of starting over.</li>
+    <li>Keys expire after 7 days, longer than any client retry window.</li>
+  </ul>
+  <h3>3 · External money movement</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Payout state</th><th>Ledger</th><th>Next</th></tr></thead>
+    <tbody>
+      <tr><td>INITIATED</td><td>user D, payout-clearing C</td><td>Call the bank with <code>ref = txnId</code> (the bank deduplicates on it)</td></tr>
+      <tr><td>PENDING / UNKNOWN</td><td>no change</td><td>Status enquiry with backoff, then the settlement file</td></tr>
+      <tr><td>SUCCEEDED</td><td>payout-clearing D, bank-settlement C</td><td>Final</td></tr>
+      <tr><td>FAILED (definite)</td><td>reversal: clearing D, user C</td><td>Final, user notified</td></tr>
+    </tbody>
+  </table></div>
+  <p>Top-up is the mirror image: no ledger entry until the PSP confirms capture. Then topup-clearing D, user C.</p>
+  <h3>4 · Sharding and cross-shard transfers</h3>
+  <ul>
+    <li>Shard <code>accounts</code> and <code>ledger_entries</code> by account id. A transfer between two accounts on the same shard is the local transaction above.</li>
+    <li>Across shards, run a two-step saga through a per-shard <b>inter-shard clearing account</b>. Step 1, on A's shard: A D, clearing C. Step 2, on B's shard: clearing D, B C. Each step is idempotent on <code>txnId</code> and driven by the outbox. If step 2 can't apply (B is frozen), a compensating step 1′ returns the money to A. Every shard balances at every moment, and the global sum of the clearing accounts is the money in flight.</li>
+    <li>The alternative is a distributed SQL database (Spanner, CockroachDB, YugabyteDB) that gives serializable cross-shard transactions. It's simpler code with higher write latency. Either is a defensible choice. Say which trade-off you're making.</li>
+  </ul>
+  <h3>5 · Hot accounts</h3>
+  <p>A large merchant receiving 1,000 payments a second serialises on one row lock. Split the merchant into N sub-accounts and credit a random one. Read the balance as the sum, and sweep them together for settlement (W5 in the LLD has the code). Credits never fail on balance, so they don't need to see the total.</p>
+
+  <h2 id="wl-h8">H8. Interviewer questions and counters</h2>
+  <details class="qa"><summary><span class="qn">Q1</span>Why a relational database? NoSQL scales better.</summary><div class="qa-body">
+    <h4>Answer</h4><p>A posting changes at least two balances and inserts two entries atomically, with constraints. That's a multi-row transaction, which relational databases do natively. The load (a few thousand transactions a second) is well within their reach, and sharding by account handles growth.</p>
+    <h4 class="change">Push-back: "DynamoDB has transactions too."</h4><p>It does, with limits on size and throughput and no check constraints. You can build a ledger on it (some companies have), but you end up re-implementing what Postgres gives you. I'd choose it only for an existing AWS-native stack, and I'd say so.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q2</span>Which isolation level, and why not SERIALIZABLE?</summary><div class="qa-body">
+    <h4>Answer</h4><p>READ COMMITTED plus explicit <code>FOR UPDATE</code> on the accounts involved, locked in a fixed order. The invariant ("balance never below zero") involves only rows we lock, so there's no write skew to worry about. SERIALIZABLE also works, but it aborts transactions under contention and the application has to retry them. It's the right choice when an invariant spans rows you don't lock.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q3</span>Why not make posting asynchronous: put transfers on Kafka and apply them in order?</summary><div class="qa-body">
+    <h4>Answer</h4><p>A user sending money expects a definite yes or no now, and insufficient funds must be rejected at the moment of the request. A Kafka log partitioned by account <i>does</i> give ordering without locks, and some large ledgers work that way. The cost is that every response becomes "pending", and a transfer touches two partitions, which brings back the cross-shard problem. Keep posting synchronous, and use Kafka for what happens after.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q4</span>Isn't this event sourcing? Why keep balances?</summary><div class="qa-body">
+    <h4>Answer</h4><p>The ledger <i>is</i> the event log, and the balance column is a projection kept in the same transaction, so it can never lag. Computing balances by summing entries on every read would be too slow for busy accounts (W2 in the LLD). A nightly job checks that <code>balance = Σ credits − Σ debits</code> for every account. A mismatch is an incident.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q5</span>How do you prove the system hasn't lost or created money?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Three checks. Per transaction: debits = credits, checked at write time and again by a streaming checker. Per account: balance = sum of its entries, checked nightly. Against the outside world: each rail's settlement file matches the clearing accounts, checked daily. Together they catch bugs, partial writes and errors at the bank's end.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q6</span>Active-active across two regions for availability?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Not for the same account. Two regions accepting debits on one balance can overdraw it. Instead: each account has a home region (active-active <i>across</i> accounts), synchronous replication within the region, and asynchronous replication to a standby region with a controlled failover. A cross-region transfer is a cross-shard saga.</p>
+    <h4 class="change">Push-back: "Then a region outage stops those users."</h4><p>Yes, until failover, which takes minutes and is rehearsed. That's the price of never double-spending. Reads (balance as of last sync, marked as possibly stale) can continue from the standby.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q7</span>The fraud model is slow (300 ms). Do you block transfers on it?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Use rule-based checks inline (velocity counters, limits, blocklists, all under 10 ms) and run the model asynchronously. For high-risk scores, act after the fact: freeze the account, hold the payout. A payout is the irreversible step, so that's where you can afford to wait for the model. A P2P transfer stays inside the system and can still be reversed.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q8</span>A user disputes a transaction from three years ago. Can you show what happened?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Yes. Entries are immutable and carry <code>balance_after</code>. The transaction row links to the idempotency key, the device and IP from the audit log, and the external reference. Old partitions are in cold storage but still queryable (for example Parquet files on S3 read with Athena). Corrections are always new transactions with <code>reverses</code> set, so history never changes.</p>
+  </div></details>

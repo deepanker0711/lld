@@ -1,0 +1,154 @@
+  <div class="part-banner" id="mb-hld"><p class="eyebrow">Part B · System design (HLD)</p><p class="part-title">A national ticketing platform</p><p>Thousands of screens across hundreds of cities. Browsing is read-heavy and can be cached. Booking is a contention problem: 300 seats, and on opening night 100,000 people who all want the middle of row H.</p></div>
+
+  <h2 id="mb-h1">H1. Functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>In scope</th><th>Out of scope</th></tr></thead>
+    <tbody><tr><td><ul>
+      <li>Browse movies by city, then cinemas and showtimes by date</li>
+      <li>See a live seat map with each seat's type and price</li>
+      <li>Hold up to 10 seats for 5 minutes, all or nothing</li>
+      <li>Pay and get a ticket with a QR code. Cancel before the cutoff for a refund.</li>
+      <li>Admin and partner tools: cinemas, screens and layouts, shows, prices</li>
+      <li>Seats sold at the cinema counter are reflected online</li>
+    </ul></td><td><ul>
+      <li>Reviews, ratings, recommendations</li>
+      <li>Food and beverage add-ons (another line on the same order)</li>
+      <li>Dynamic pricing (M5 in the LLD)</li>
+      <li>Events with general admission (a counter, not seats)</li>
+    </ul></td></tr></tbody>
+  </table></div>
+
+  <h2 id="mb-h2">H2. Non-functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quality</th><th>Target</th><th>Why, and what it forces</th></tr></thead>
+    <tbody>
+      <tr><td>No double booking</td><td>Strong consistency per seat</td><td>Every seat of a show lives in one database partition, and holds are a single conditional update across them.</td></tr>
+      <tr><td>Browse availability</td><td>99.99%</td><td>Served from CDN and cache. It survives the booking path being down.</td></tr>
+      <tr><td>Booking availability</td><td>99.95%</td><td>Degrades per show: one hot show must not take down booking for every other show.</td></tr>
+      <tr><td>Latency</td><td>seat map p99 &lt; 200 ms · hold p99 &lt; 300 ms</td><td>The seat map comes from cache and can be a few seconds stale. The hold must be authoritative.</td></tr>
+      <tr><td>Freshness</td><td>Seat map ≤ 2 s behind</td><td>Changes are pushed, so viewers don't click seats that are already taken.</td></tr>
+      <tr><td>Fairness under spikes</td><td>First come, first served at the gate</td><td>A waiting room in front of hot shows, not a free-for-all of retries.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="mb-h3">H3. Capacity estimation</h2>
+  <p>Assumptions: 2M tickets a day, 2.5 tickets per booking, 20 seat-map views per booking, 10k screens with 5 shows a day each and ~250 seats per screen, shows open for sale 14 days ahead. Normal peak is 5× average. A blockbuster opening is far worse and is estimated separately.</p>
+  <div class="table-wrap"><table class="calc">
+    <thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Bookings</td><td>2M ÷ 2.5 = 800k/day ≈ 9/s · ×5</td><td class="num">~50/s peak</td></tr>
+      <tr><td>Seat-map views</td><td>800k × 20 = 16M/day ≈ 185/s · ×5</td><td class="num">~1k/s peak</td></tr>
+      <tr><td>Blockbuster opening</td><td>100k users within 1 min of sales opening</td><td class="num">~1.7k holds/s, mostly on a few shows</td></tr>
+      <tr><td>Shows on sale</td><td>10k × 5 × 14 days</td><td class="num">700k shows</td></tr>
+      <tr><td>Seat rows</td><td>700k × 250 × ~60 B</td><td class="num">175M rows ≈ 10 GB</td></tr>
+      <tr><td>Bookings storage</td><td>800k × 1 KB</td><td class="num">~0.8 GB/day ≈ 300 GB/year</td></tr>
+      <tr><td>WebSocket connections</td><td>viewers on seat maps at peak</td><td class="num">~50k–200k</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout"><b>What the numbers tell you</b><p>Average write volume is tiny, and all the seat data fits on one machine. The design is driven by the hottest show: thousands of conflicting writes against 300 rows. Sharding by <code>show_id</code> keeps each show's seats together, so a multi-seat hold is one local transaction.</p></div>
+
+  <h2 id="mb-h4">H4. API design</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Endpoint</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><span class="verb">GET</span> <code>/v1/cities/{city}/movies?date=</code></td><td>Cached at the CDN for 60 s</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/movies/{id}/shows?city=&amp;date=</code></td><td>Grouped by cinema. Includes a "filling fast" hint that comes from a counter, not a seat scan.</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/shows/{id}/seats</code></td><td>Layout (immutable, cached for a long time) plus a status bitmap with a <code>version</code>. Supports <code>If-None-Match</code>.</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/shows/{id}/seats/stream</code></td><td>SSE or WebSocket: <code>{version, changed: [{seat, status}]}</code></td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/shows/{id}/holds</code></td><td><code>{seats: ["H7","H8"]}</code> → 201 <code>{holdId, expiresAt, quote}</code> · 409 <code>{taken: [...]}</code> · 429 at the waiting room</td></tr>
+      <tr><td><span class="verb">DELETE</span> <code>/v1/holds/{id}</code></td><td>Releases the seats straight away</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/holds/{id}/checkout</code></td><td><code>Idempotency-Key</code>. 201 booking <code>PENDING_PAYMENT</code> plus a payment action. 410 if the hold has expired.</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/bookings/{id}</code> · <span class="verb">POST</span> <code>/cancel</code></td><td>Cancel: 422 after the cutoff; otherwise 202 and the refund saga starts</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="mb-h5">H5. High-level design</h2>
+  <div class="diagram">{{mb-arch}}<p class="diagram-caption">Browsing is served from search and cache. Show inventory is the only writer of seat state. Seat changes go out as events, and a push service fans them out to everyone viewing that show.</p></div>
+  <ul>
+    <li><b>Read path:</b> movies and shows come from Elasticsearch behind a CDN. The seat layout is immutable per screen and cached for days. The status bitmap is cached in Redis per show and updated from <code>SeatsChanged</code> events.</li>
+    <li><b>Write path:</b> holds go to show inventory, which runs one conditional update per request on the show's partition. Booking orchestrates payment and the final state, just like the checkout saga.</li>
+    <li><b>Hot shows:</b> when demand for a show crosses a threshold, the gateway's waiting room lets users in at a rate the partition can serve (H7.3).</li>
+    <li><b>Partner cinemas:</b> chains with their own box-office systems sync both ways through an adapter. Counter sales come in as holds from a "box office" channel, so there is still one writer of seat state.</li>
+  </ul>
+  <div class="diagram">{{mb-seq}}<p class="diagram-caption">CONFIRMING fences the hold before money moves. The sweeper skips CONFIRMING seats, so a slow payment can't lose them, and a dead payment can't keep them forever.</p></div>
+
+  <h2 id="mb-h6">H6. Database design</h2>
+  <p><b>Choice: Postgres, partitioned by show.</b> Seat state needs multi-row atomic updates and constraints. Each show's seats are a few hundred rows that are always accessed together, so <code>show_id</code> is the natural shard key. Catalog data is replicated to Elasticsearch for search.</p>
+  <div class="code" data-src="sql"><div class="code-head"><span>schema</span><button type="button" data-copy>Copy</button></div><script type="text/plain">CREATE TABLE screens (id uuid PRIMARY KEY, cinema_id uuid NOT NULL, name text, layout jsonb NOT NULL);
+CREATE TABLE shows (
+  id uuid PRIMARY KEY, screen_id uuid NOT NULL, movie_id uuid NOT NULL,
+  starts_at timestamptz NOT NULL, ends_at timestamptz NOT NULL, prices jsonb NOT NULL,
+  -- no two shows overlap on a screen, including 20 min turnaround: the database enforces it
+  EXCLUDE USING gist (screen_id WITH =, tstzrange(starts_at, ends_at + interval '20 min') WITH &&)
+);
+CREATE TABLE show_seats (                       -- created when the show is published
+  show_id uuid, seat text, seat_type text,
+  status text NOT NULL DEFAULT 'FREE',          -- FREE | HELD | CONFIRMING | BOOKED
+  hold_id uuid, hold_expires_at timestamptz, version int NOT NULL DEFAULT 0,
+  PRIMARY KEY (show_id, seat)
+) PARTITION BY HASH (show_id);
+CREATE TABLE bookings (
+  id uuid PRIMARY KEY, hold_id uuid UNIQUE, user_id uuid, show_id uuid,
+  status text, total_paise bigint, created_at timestamptz
+);
+CREATE INDEX bookings_by_user ON bookings (user_id, created_at DESC);
+CREATE TABLE booking_seats (booking_id uuid, show_id uuid, seat text, PRIMARY KEY (booking_id, seat));
+CREATE UNIQUE INDEX one_confirmed_booking_per_seat ON booking_seats (show_id, seat);   -- belt and braces</script></div>
+  <ul>
+    <li>The exclusion constraint is the database form of the LLD's overlap check: two admins scheduling at once can't both succeed.</li>
+    <li>Old shows: when a show has finished, its <code>show_seats</code> rows are archived. Bookings keep the seat list in <code>booking_seats</code>, so history doesn't depend on the live table.</li>
+  </ul>
+
+  <h2 id="mb-h7">H7. Detailed component design</h2>
+  <h3>1 · The hold: one statement, all or nothing</h3>
+  <div class="code" data-src="sql"><div class="code-head"><span>hold</span><button type="button" data-copy>Copy</button></div><script type="text/plain">UPDATE show_seats
+   SET status = 'HELD', hold_id = $hold, hold_expires_at = now() + interval '5 min', version = version + 1
+ WHERE show_id = $show AND seat = ANY($seats)
+   AND (status = 'FREE' OR (status = 'HELD' AND hold_expires_at < now()))   -- lazy expiry, as in the LLD
+RETURNING seat;
+-- returned count < requested → ROLLBACK, then SELECT which seats were taken → 409 {taken}</script></div>
+  <p>Postgres locks each matching row, so two overlapping holds serialise on the shared seats and the second sees them as taken. Lock order is not a deadlock risk here because each statement locks rows in index order. Holding nothing across a network call keeps lock time to milliseconds.</p>
+  <h3>2 · Hold expiry</h3>
+  <ul>
+    <li><b>Correctness is lazy:</b> an expired hold counts as free in the <code>WHERE</code> clause above, so the next hold simply takes the seat. No timer has to fire on time.</li>
+    <li><b>Cleanliness is a sweeper:</b> every 30 s, <code>UPDATE … SET status = 'FREE' WHERE status = 'HELD' AND hold_expires_at &lt; now()</code>, which emits <code>SeatsChanged</code> so seat maps turn green again.</li>
+    <li><code>CONFIRMING</code> is skipped by both, until <code>hold_expires_at + payment window</code>. After that, the reconciler asks the PSP before releasing anything.</li>
+  </ul>
+  <h3>3 · Hot-show admission (waiting room)</h3>
+  <ul>
+    <li>Demand per show is measured at the gateway. Above a threshold, new visitors to that show get a signed queue ticket with a position, and an admitter lets in N users a second (for example 200/s), sized to what the partition can serve.</li>
+    <li>Admitted users get a short-lived token that the hold endpoint requires. Without a token, the request gets 429 at the edge and never reaches the database.</li>
+    <li>This also gives fairness: requests are served in arrival order, instead of rewarding whoever retries fastest.</li>
+  </ul>
+  <h3>4 · Live seat map fan-out</h3>
+  <ul>
+    <li>Show inventory publishes <code>SeatsChanged {show, version, seats}</code> through its outbox. A push tier subscribes per show (Redis pub/sub, or a Kafka consumer that routes by show) and forwards to every socket watching that show.</li>
+    <li>Clients apply deltas in version order. On a gap or a reconnect they fetch the snapshot again with <code>GET /seats</code>. This is a classic snapshot-plus-deltas design.</li>
+    <li>For a hot show, batch the updates every 500 ms. 100k viewers × 50 updates a second unbatched is 5M messages a second. Batched, it's 200k.</li>
+  </ul>
+
+  <h2 id="mb-h8">H8. Interviewer questions and counters</h2>
+  <details class="qa"><summary><span class="qn">Q1</span>Why lock seats in the database? Redis with SETNX is much faster.</summary><div class="qa-body">
+    <h4>Answer</h4><p>The database is the source of truth, and a single conditional update is atomic across all the seats with no extra moving parts. Average load is 50 holds a second. Redis (the Lua script in M1) is a valid choice for hot shows. But then you have two stores that must agree when the booking is confirmed, and if Redis loses a key on failover, the same seat can be sold twice.</p>
+    <h4 class="change">Push-back: "Opening night, 1.7k holds/s on one show."</h4><p>Most of those fail fast on a couple of hundred rows, and the waiting room caps the arrival rate anyway. If measurements show the partition still struggles, add Redis as a <i>pre-filter</i>: reject requests for seats Redis already shows as held, and let the database decide the rest.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q2</span>Optimistic or pessimistic locking?</summary><div class="qa-body">
+    <h4>Answer</h4><p>The hold statement is effectively optimistic, because the condition is checked in the update itself and nothing is locked while the user thinks. Row locks last only for the duration of the statement. A <code>SELECT … FOR UPDATE</code> followed by application logic and then an update would hold locks across a round trip and serialise everyone on popular seats.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q3</span>Why 5 minutes for a hold? Why not 15?</summary><div class="qa-body">
+    <h4>Answer</h4><p>It's a trade-off between letting slow payers finish and keeping seats from being locked by people who walked away. Seats are scarce and demand is spiky, so it's short, unlike a shopping cart. CONFIRMING then extends the hold <i>only</i> for users who actually started paying. Measure abandonment and tune it per channel.</p>
+    <h4 class="change">Push-back: "Bots hold seats and let them expire, over and over."</h4><p>Rate-limit holds per user and device, require a login before holding, cap active holds at one per user per show, and add a short cool-down after an expiry.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q4</span>Payment succeeds but the seats were already released and resold.</summary><div class="qa-body">
+    <h4>Answer</h4><p>CONFIRMING is designed to stop this from happening at all. If it still happens (for example a very late webhook after the grace period), the booking becomes <code>FAILED_SEATS_LOST</code>, an automatic refund is issued, and the user is told straight away. Optionally, offer the nearest free seats of the same type. The PSP payment link expiring before the grace period ends is what keeps this rare.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q5</span>Why not put every booking request on a queue partitioned by show and process them serially?</summary><div class="qa-body">
+    <h4>Answer</h4><p>It works, and it removes lock contention: a single consumer per show applies holds in order. The costs are a synchronous user action turned into async (the client has to poll or wait for a push to learn whether it got the seats), and queue lag on hot shows when users need an answer within a second. A conditional update gives the same serialisation per row with an immediate answer. I'd use the queue only if the database truly couldn't keep up after the waiting room.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q6</span>How do you keep the seat map fresh for 100k viewers without hammering the database?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Viewers never read the database: snapshots come from the Redis bitmap and changes are pushed (H7.4). Holds are the only database writes, and each produces one event, however many people are watching.</p>
+    <h4 class="change">Push-back: "WebSockets are expensive. Why not poll?"</h4><p>Polling every 2 s × 100k viewers is 50k requests a second that mostly return "no change". With ETags they're cheap, and that's an acceptable fallback (and what mobile clients on bad networks use). A push connection is idle almost all the time, which costs less at this scale.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q7</span>The cinema's own box office sells seats too. Who is the source of truth?</summary><div class="qa-body">
+    <h4>Answer</h4><p>One system has to own each show's inventory. Usually that's the cinema chain's system, and we are a sales channel with an allocation or a live API. If they own it, our hold becomes a call to their API with a timeout, and we show "pending" when they're slow. If we own it, their counter becomes another client of our hold API. The bad option is two sources syncing after the fact, because the same seat then gets sold twice.</p>
+  </div></details>

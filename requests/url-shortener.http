@@ -1,0 +1,60 @@
+# VS Code REST Client: click "Send Request" on each block, top to bottom.
+@base = http://localhost:3000
+
+### 1. Shorten -> 201, code "1"
+POST {{base}}/urls
+Content-Type: application/json
+
+{ "longUrl": "https://www.keka.com/careers" }
+
+### 2. Same URL again -> 200, same code (dedupe)
+POST {{base}}/urls
+Content-Type: application/json
+
+{ "longUrl": "https://www.keka.com/careers" }
+
+### 3. Custom alias -> 201
+POST {{base}}/urls
+Content-Type: application/json
+
+{ "longUrl": "https://github.com/nestjs/nest", "alias": "nest" }
+
+### 4. Redirect -> 302 Location: https://github.com/nestjs/nest
+# (REST Client follows redirects; use curl -i to see the 302)
+GET {{base}}/nest
+
+### 5. Stats -> clicks 1
+GET {{base}}/urls/nest/stats
+
+### 6. Link that expires in 10 s (GET it after 10 s -> 410 GONE)
+POST {{base}}/urls
+Content-Type: application/json
+
+{ "longUrl": "https://example.com/otp", "alias": "otp-link", "ttlSeconds": 10 }
+
+###
+GET {{base}}/otp-link
+
+### 7. Alias taken -> 409
+POST {{base}}/urls
+Content-Type: application/json
+
+{ "longUrl": "https://other.com", "alias": "nest" }
+
+### 8. Reserved alias -> 400
+POST {{base}}/urls
+Content-Type: application/json
+
+{ "longUrl": "https://other.com", "alias": "health" }
+
+### 9. Invalid URL and alias -> 400 with both messages
+POST {{base}}/urls
+Content-Type: application/json
+
+{ "longUrl": "not-a-url", "alias": "a!" }
+
+### 10. Unknown code -> 404
+GET {{base}}/doesnotexist
+
+### 11. Delete
+DELETE {{base}}/urls/nest

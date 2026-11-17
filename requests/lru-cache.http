@@ -1,0 +1,65 @@
+# Click "Send Request" (VS Code REST Client extension) on each block, top to bottom.
+@base = http://localhost:3000
+
+### Health
+GET {{base}}/health
+
+### 1. Create a cache with capacity 2
+POST {{base}}/caches
+Content-Type: application/json
+
+{ "name": "users", "capacity": 2 }
+
+### 2. Put a
+PUT {{base}}/caches/users/keys/a
+Content-Type: application/json
+
+{ "value": { "id": 1, "name": "Asha" } }
+
+### 3. Put b
+PUT {{base}}/caches/users/keys/b
+Content-Type: application/json
+
+{ "value": "two" }
+
+### 4. Get a  -> a becomes most recently used
+GET {{base}}/caches/users/keys/a
+
+### 5. Put c  -> evictedKey: "b"
+PUT {{base}}/caches/users/keys/c
+Content-Type: application/json
+
+{ "value": 3 }
+
+### 6. Get b  -> 404
+GET {{base}}/caches/users/keys/b
+
+### 7. Keys, most recent first  -> [c, a]
+GET {{base}}/caches/users/keys
+
+### 8. Stats
+GET {{base}}/caches/users/stats
+
+### 9. Key with a 5 s TTL (GET it again after 5 s -> 404)
+PUT {{base}}/caches/users/keys/otp
+Content-Type: application/json
+
+{ "value": "123456", "ttlMs": 5000 }
+
+### 10. Validation error (400): capacity 0, unknown field
+POST {{base}}/caches
+Content-Type: application/json
+
+{ "name": "bad name!", "capacity": 0, "foo": 1 }
+
+### 11. Duplicate (409)
+POST {{base}}/caches
+Content-Type: application/json
+
+{ "name": "users", "capacity": 2 }
+
+### 12. Delete a key / delete the cache
+DELETE {{base}}/caches/users/keys/a
+
+###
+DELETE {{base}}/caches/users

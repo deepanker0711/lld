@@ -1,0 +1,157 @@
+  <div class="part-banner" id="sw-hld"><p class="eyebrow">Part B · System design (HLD)</p><p class="part-title">An expense-sharing app for 50M users</p><p>The load is modest, and every group is small and independent. The design questions are: where balances live and how they stay exact to the paisa, how edits change balances that have already been settled, offline clients, and a user's total across hundreds of groups.</p></div>
+
+  <h2 id="sw-h1">H1. Functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>In scope</th><th>Out of scope</th></tr></thead>
+    <tbody><tr><td><ul>
+      <li>Groups and friends. An expense can be in a group or just between two people.</li>
+      <li>Add, edit and delete an expense: one or more payers; equal, exact, percent or shares splits</li>
+      <li>Balances per group, per friend, and overall. "Simplify debts".</li>
+      <li>Record a settlement, optionally paid through a UPI deep link</li>
+      <li>Activity feed, comments, receipt photos, notifications</li>
+      <li>Works offline on mobile and syncs later</li>
+    </ul></td><td><ul>
+      <li>Moving money ourselves. We record payments; UPI apps move the money.</li>
+      <li>OCR of receipts</li>
+      <li>Budgets and analytics</li>
+    </ul></td></tr></tbody>
+  </table></div>
+
+  <h2 id="sw-h2">H2. Non-functional requirements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quality</th><th>Target</th><th>Why, and what it forces</th></tr></thead>
+    <tbody>
+      <tr><td>Exactness</td><td>Shares sum exactly; group nets sum to 0</td><td>Integer paise, largest-remainder rounding on the server. The client only previews.</td></tr>
+      <tr><td>Consistency</td><td>Read-your-writes within a group; other views eventual (seconds)</td><td>Group balances change in the same transaction as the expense. Cross-group totals are a projection.</td></tr>
+      <tr><td>Availability</td><td>99.9%, and offline-capable</td><td>Not a payments system. The app queues writes and syncs.</td></tr>
+      <tr><td>Latency</td><td>Group screen p99 &lt; 200 ms</td><td>Balances are read, not recomputed. The simplified view is cached by group version.</td></tr>
+      <tr><td>Auditability</td><td>Every edit visible</td><td>Expense history and an activity feed. A deleted expense is soft-deleted and can be restored.</td></tr>
+      <tr><td>Privacy</td><td>Group data visible to members only</td><td>Authorise every read by membership, including receipt URLs, which are short-lived and signed.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="sw-h3">H3. Capacity estimation</h2>
+  <p>Assumptions: 50M users, 5M DAU, 1 expense per DAU per day, 4 participants per expense, 10 group or balance views per DAU, 10% of expenses with a 500 KB receipt, 20M groups with 5 members on average. Peak is 5×.</p>
+  <div class="table-wrap"><table class="calc">
+    <thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Expense writes</td><td>5M/day ≈ 58/s · ×5</td><td class="num">~300/s peak</td></tr>
+      <tr><td>Reads</td><td>50M/day ≈ 580/s · ×5</td><td class="num">~3k/s peak</td></tr>
+      <tr><td>Expense storage</td><td>5M × ~1 KB (with payer and share rows)</td><td class="num">5 GB/day ≈ 1.8 TB/year</td></tr>
+      <tr><td>Receipts</td><td>500k × 500 KB</td><td class="num">250 GB/day ≈ 90 TB/year (object storage)</td></tr>
+      <tr><td>Balance rows</td><td>20M groups × 5 members × ~50 B</td><td class="num">~5 GB</td></tr>
+      <tr><td>Simplify cost</td><td>sort n nets: n ≈ 5–50</td><td class="num">microseconds</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout"><b>What the numbers tell you</b><p>Load is low and receipts dominate storage, so they go straight to object storage via presigned URLs and never pass through our servers. Because each group is small and independent, a single group never needs to scale. That makes <code>group_id</code> the obvious shard key.</p></div>
+
+  <h2 id="sw-h4">H4. API design</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Endpoint</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><span class="verb">POST</span> <code>/v1/groups</code> · <code>/groups/{id}/members</code></td><td>Invite by email or phone. The member is "pending" until they join.</td></tr>
+      <tr><td><span class="verb">PUT</span> <code>/v1/groups/{g}/expenses/{clientUuid}</code></td><td>Create with an id generated on the client, so offline retries are naturally idempotent. Body: payers[], split {type, entries}, currency, date. 201, or 200 if it already exists with the same body.</td></tr>
+      <tr><td><span class="verb">PATCH</span> <code>/v1/expenses/{id}</code> · <span class="verb">DELETE</span></td><td><code>If-Match: &lt;version&gt;</code> required. 412 with the current version if it has changed.</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/groups/{g}/balances?view=net|simplified|pairwise</code></td><td>Returns <code>groupVersion</code>; the simplified view is cached on it</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/groups/{g}/settlements</code></td><td>Same idempotency rules as expenses. 422 if the amount exceeds what's owed.</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/me/balances</code></td><td>Totals per friend across all groups, from the summary projection</td></tr>
+      <tr><td><span class="verb">GET</span> <code>/v1/sync?cursor=</code></td><td>Every change in the user's groups since the cursor. Drives offline catch-up.</td></tr>
+      <tr><td><span class="verb">POST</span> <code>/v1/receipts/upload-url</code></td><td>Returns a presigned PUT URL; the client uploads directly</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="sw-h5">H5. High-level design</h2>
+  <div class="diagram">{{sw-arch}}<p class="diagram-caption">One expense service owns groups, expenses and balances on a database sharded by group. Everything that spans groups (overall totals, the feed, notifications) is built from events.</p></div>
+  <ul>
+    <li><b>Write path:</b> validate membership → split engine computes exact shares → in one transaction: insert the expense, payer and share rows, apply balance deltas, bump the group version, write an outbox row.</li>
+    <li><b>Group read path:</b> net balances come straight from the <code>balances</code> rows. The simplified view comes from Redis under the key <code>(group, version)</code>, so it is invalidated by the version bump and computed again on a miss.</li>
+    <li><b>Friend-to-friend expenses</b> outside any group are stored in an implicit two-person group. One code path, and it's still sharded by group.</li>
+    <li><b>Cross-group "you owe Asha ₹1,240 in total"</b> is a projection keyed by user, updated from <code>ExpenseAdded/Edited/Deleted</code> and <code>SettlementRecorded</code> events.</li>
+  </ul>
+  <div class="diagram">{{sw-seq}}<p class="diagram-caption">An id generated on the client makes create idempotent. A version on update makes edits safe.</p></div>
+
+  <h2 id="sw-h6">H6. Database design</h2>
+  <p><b>Choice: Postgres, sharded by <code>group_id</code>.</b> An expense, its shares and the balance deltas must change together. Everything a group screen needs is on one shard.</p>
+  <div class="code" data-src="sql"><div class="code-head"><span>schema</span><button type="button" data-copy>Copy</button></div><script type="text/plain">CREATE TABLE groups (id uuid PRIMARY KEY, name text, default_currency char(3),
+                     is_direct boolean NOT NULL DEFAULT false,   -- implicit 2-person group
+                     version bigint NOT NULL DEFAULT 0);
+CREATE TABLE group_members (group_id uuid, user_id uuid, joined_at timestamptz, left_at timestamptz,
+                            PRIMARY KEY (group_id, user_id));
+CREATE TABLE expenses (
+  id uuid PRIMARY KEY,                           -- generated on the client
+  group_id uuid NOT NULL, created_by uuid, description text,
+  amount_paise bigint NOT NULL CHECK (amount_paise > 0), currency char(3) NOT NULL,
+  split_type text NOT NULL, spent_on date NOT NULL,
+  version int NOT NULL DEFAULT 1, deleted_at timestamptz, created_at timestamptz DEFAULT now()
+);
+CREATE INDEX expenses_by_group ON expenses (group_id, spent_on DESC, id) WHERE deleted_at IS NULL;
+CREATE TABLE expense_payers (expense_id uuid, user_id uuid, paid_paise bigint, PRIMARY KEY (expense_id, user_id));
+CREATE TABLE expense_shares (expense_id uuid, user_id uuid, owed_paise bigint,
+                             input numeric,      -- the % / shares / exact the user typed, for editing
+                             PRIMARY KEY (expense_id, user_id));
+CREATE TABLE settlements (id uuid PRIMARY KEY, group_id uuid, from_user uuid, to_user uuid,
+                          amount_paise bigint, currency char(3), version int, deleted_at timestamptz);
+CREATE TABLE balances (group_id uuid, user_id uuid, currency char(3), net_paise bigint NOT NULL DEFAULT 0,
+                       PRIMARY KEY (group_id, user_id, currency));      -- + owed to them, − they owe
+CREATE TABLE expense_history (expense_id uuid, version int, snapshot jsonb, edited_by uuid, at timestamptz,
+                              PRIMARY KEY (expense_id, version));</script></div>
+  <ul>
+    <li>Invariant per group and currency: <code>Σ net_paise = 0</code>. Checked when the delta is applied (deltas sum to zero by construction) and again by a nightly job.</li>
+    <li>"My groups" for a user spans shards. Keep a <code>user_groups</code> table on the user's shard, written by the membership events, or serve it from the summary store.</li>
+  </ul>
+
+  <h2 id="sw-h7">H7. Detailed component design</h2>
+  <h3>1 · Split engine</h3>
+  <p>The same strategies as the LLD (equal, exact, percent in basis points, shares) with largest-remainder apportionment, so shares always add up to the amount exactly. The server is authoritative: the client sends the <i>inputs</i> (the percentages it typed), and the server computes and stores the paise. Multiple payers are just a second vector: each member's delta is <code>paid − owed</code>, and the deltas sum to zero.</p>
+  <h3>2 · Balance maintenance by deltas</h3>
+  <div class="code" data-src="ts"><div class="code-head"><span>create / edit / delete are one operation</span><button type="button" data-copy>Copy</button></div><script type="text/plain">// delta(expense) = Map<userId, paid - owed>;  Σ values = 0
+applyChange(groupId, before: Expense | null, after: Expense | null) {
+  const d = subtract(delta(after), delta(before));     // create: before=null · delete: after=null
+  tx(() => {
+    lockGroup(groupId);                                 // UPDATE groups SET version = version + 1 … RETURNING version
+    for (const [user, paise] of d) upsertBalance(groupId, user, currency, paise);   // net += paise
+    writeOutbox('ExpenseChanged', { groupId, delta: d, version });
+  });
+}</script></div>
+  <p>Edits never recompute history: they apply the difference. Settlements are expenses with a single payer and a single participant, so they flow through the same path. That answers S4 in the LLD: past settlements stay as they are, and the edit simply leaves a new non-zero balance.</p>
+  <h3>3 · Debt simplification</h3>
+  <ul>
+    <li>Greedy over net balances: repeatedly match the largest creditor with the largest debtor. At most n − 1 payments, O(n log n). That's microseconds for real groups.</li>
+    <li>Finding the true minimum number of payments is NP-hard (it means finding zero-sum subsets). Greedy can be one payment worse: S2 in the LLD has a counterexample.</li>
+    <li>Cached on <code>(group, version)</code>, so a busy group is computed once per change, not once per view.</li>
+    <li>A per-group setting "don't simplify" serves the pairwise view instead (who owes whom, exactly as recorded). That needs a <code>pairwise(group, debtor, creditor)</code> table maintained by the same deltas.</li>
+  </ul>
+  <h3>4 · Offline sync</h3>
+  <ul>
+    <li>The client keeps a queue of operations, each with its own UUID. Creates are idempotent by id, and edits carry the base version.</li>
+    <li>On reconnect, push the queue in order, then <code>GET /sync?cursor</code>. Each group has a change log ordered by version, and the cursor is a map of <code>{groupId: version}</code>.</li>
+    <li>Conflicts: edits to different expenses never conflict. An edit to the same expense from two devices gets 412, and the app shows both versions. Money is not something to merge silently with last-writer-wins.</li>
+  </ul>
+
+  <h2 id="sw-h8">H8. Interviewer questions and counters</h2>
+  <details class="qa"><summary><span class="qn">Q1</span>Store balances, or compute them from expenses on read?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Store them, updated by deltas in the same transaction as the expense. Reads outnumber writes 10:1, and some groups have thousands of expenses (S1 in the LLD). Expenses remain the source of truth: balances can always be rebuilt from them, and the nightly check does exactly that for a sample of groups.</p>
+    <h4 class="change">Push-back: "Now you have two sources that can disagree."</h4><p>Only if a write bypasses the single <code>applyChange</code> path, and the transaction makes them change together. The invariant check (Σ = 0, plus a rebuild-and-compare) catches bugs. The LLD derived balances on read because in memory that's free. Different constraints, different choice.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q2</span>Shard by group or by user?</summary><div class="qa-body">
+    <h4>Answer</h4><p>By group. Every write touches exactly one group, and many users, so sharding by user would turn each expense into a transaction across shards. The group is the unit of consistency. The cost is that per-user views span groups, and those come from a projection that may lag by seconds.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q3</span>Why not let the client compute shares and balances? It has all the data.</summary><div class="qa-body">
+    <h4>Answer</h4><p>Clients run different versions, round differently, and can be tampered with. Two phones computing a three-way split of ₹100 must agree on who pays the extra paisa. The client previews with the same algorithm, and the server decides and stores.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q4</span>Can you guarantee the minimum number of payments?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Not in general. Minimising transactions is NP-hard. For small groups (n ≤ 12 or so) you can search exhaustively: split the members into as many zero-sum subsets as possible, and the answer is n minus that count. That's affordable when computed once per version and cached. Above that, use greedy and accept that it may need an extra payment.</p>
+    <h4 class="change">Push-back: "Greedy can make strangers pay each other."</h4><p>True. Optionally restrict matches to pairs who share an expense, or show the pairwise view. That's a product choice, not an algorithm bug.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q5</span>Two people edit the same expense offline. Who wins?</summary><div class="qa-body">
+    <h4>Answer</h4><p>The first to sync wins, and the second gets a 412 with the current version. The app asks the user to re-apply the change. Merging field by field (one fixed the description, the other the amount) is possible, since the fields are independent, but the amount and the split must never be merged automatically.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q6</span>Someone is in 300 groups. Their home screen total is slow.</summary><div class="qa-body">
+    <h4>Answer</h4><p>It's never computed live: the summary projection stores, per user, the totals per friend and currency, updated incrementally from events. Reading it is one key lookup. If the projection ever drifts, rebuild it for that user from their groups' balances. That operation is idempotent and cheap.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q7</span>A trip abroad: expenses in EUR and INR. How do balances work?</summary><div class="qa-body">
+    <h4>Answer</h4><p>Keep balances per currency (the key includes currency), so nothing is converted until someone chooses to. "Settle in INR" converts at the rate on the settlement date and records that rate. Converting each expense at its own date's rate is an option for users who want a single number, and the stored rate keeps it reproducible. S3 in the LLD covers the model change.</p>
+  </div></details>
+  <details class="qa"><summary><span class="qn">Q8</span>Why have Kafka at all? It's a small app.</summary><div class="qa-body">
+    <h4>Answer</h4><p>For the side effects that shouldn't be in the write transaction: the feed, push notifications, email digests, the summary projection. At this scale a Postgres outbox table polled by a worker is enough. Kafka becomes worthwhile when several independent consumers need replay, for example analytics. Start with the outbox; the event contract is the same either way.</p>
+  </div></details>

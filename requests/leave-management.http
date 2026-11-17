@@ -1,0 +1,135 @@
+# VS Code REST Client: click "Send Request" on each block, top to bottom.
+# Dates are in December 2026 so CASUAL/EARNED notice rules pass; if today is later, move them forward.
+# Quotas: CASUAL 12, SICK 10, EARNED 15. Holidays: 2026-11-09, 2026-12-25. "Today" = date in Asia/Kolkata.
+@base = http://localhost:3000
+
+### 1. Manager (no manager of their own)
+# @name mgr
+POST {{base}}/employees
+Content-Type: application/json
+
+{ "name": "Mgr", "email": "m@k.com" }
+
+### 2. Asha reports to Mgr → 201 with seeded balances
+# @name asha
+POST {{base}}/employees
+Content-Type: application/json
+
+{ "name": "Asha", "email": "a@k.com", "managerId": "{{mgr.response.body.data.id}}" }
+
+### 3. Ravi, also reporting to Mgr
+# @name ravi
+POST {{base}}/employees
+Content-Type: application/json
+
+{ "name": "Ravi", "email": "r@k.com", "managerId": "{{mgr.response.body.data.id}}" }
+
+### 4. Same email, different case → 409
+POST {{base}}/employees
+Content-Type: application/json
+
+{ "name": "Dup", "email": "A@K.com" }
+
+### 5. Asha applies CASUAL Wed–Thu → 201 PENDING, days 2
+# @name leave
+POST {{base}}/leaves
+Content-Type: application/json
+
+{ "employeeId": "{{asha.response.body.data.id}}", "type": "CASUAL", "from": "2026-12-02", "to": "2026-12-03", "reason": "family trip" }
+
+### 6. Balances: CASUAL pending 2, available 10
+GET {{base}}/employees/{{asha.response.body.data.id}}/balances
+
+### 7. Overlapping by one day → 409 (shows the clashing leave)
+POST {{base}}/leaves
+Content-Type: application/json
+
+{ "employeeId": "{{asha.response.body.data.id}}", "type": "CASUAL", "from": "2026-12-03", "to": "2026-12-03", "reason": "again" }
+
+### 8. Weekend only → 400 no working days
+POST {{base}}/leaves
+Content-Type: application/json
+
+{ "employeeId": "{{asha.response.body.data.id}}", "type": "CASUAL", "from": "2026-12-05", "to": "2026-12-06", "reason": "x" }
+
+### 9. CASUAL longer than 3 days → 422 (CasualLeavePolicy)
+POST {{base}}/leaves
+Content-Type: application/json
+
+{ "employeeId": "{{asha.response.body.data.id}}", "type": "CASUAL", "from": "2026-12-07", "to": "2026-12-11", "reason": "x" }
+
+### 10. SICK for 11 working days → 422 { available: 10, requested: 11 }
+POST {{base}}/leaves
+Content-Type: application/json
+
+{ "employeeId": "{{asha.response.body.data.id}}", "type": "SICK", "from": "2026-12-07", "to": "2026-12-21", "reason": "surgery" }
+
+### 11. Bad DTO → 400: unknown type, impossible date, "no" as a boolean
+POST {{base}}/leaves
+Content-Type: application/json
+
+{ "employeeId": "{{asha.response.body.data.id}}", "type": "VACATION", "from": "2026-02-30", "to": "2026-12-01", "halfDay": "no", "reason": "x" }
+
+### 12. Manager's inbox: PENDING leaves of direct reports, soonest first
+GET {{base}}/managers/{{mgr.response.body.data.id}}/pending-approvals
+
+### 13. Asha approves her own leave → 403
+POST {{base}}/leaves/{{leave.response.body.data.id}}/approve
+Content-Type: application/json
+
+{ "approverId": "{{asha.response.body.data.id}}" }
+
+### 14. Ravi (a peer) approves → 403
+POST {{base}}/leaves/{{leave.response.body.data.id}}/approve
+Content-Type: application/json
+
+{ "approverId": "{{ravi.response.body.data.id}}" }
+
+### 15. Manager approves → 200 APPROVED
+POST {{base}}/leaves/{{leave.response.body.data.id}}/approve
+Content-Type: application/json
+
+{ "approverId": "{{mgr.response.body.data.id}}", "comment": "Enjoy" }
+
+### 16. Approve again → 409 (allowed: CANCELLED)
+POST {{base}}/leaves/{{leave.response.body.data.id}}/approve
+Content-Type: application/json
+
+{ "approverId": "{{mgr.response.body.data.id}}" }
+
+### 17. Balances: CASUAL used 2, pending 0
+GET {{base}}/employees/{{asha.response.body.data.id}}/balances
+
+### 18. Ravi applies a half day → 201 days 0.5
+# @name half
+POST {{base}}/leaves
+Content-Type: application/json
+
+{ "employeeId": "{{ravi.response.body.data.id}}", "type": "CASUAL", "from": "2026-12-04", "to": "2026-12-04", "halfDay": true, "reason": "doctor" }
+
+### 19. Reject without a comment → 400
+POST {{base}}/leaves/{{half.response.body.data.id}}/reject
+Content-Type: application/json
+
+{ "approverId": "{{mgr.response.body.data.id}}" }
+
+### 20. Reject with a comment → 200 REJECTED, Ravi's 0.5 released
+POST {{base}}/leaves/{{half.response.body.data.id}}/reject
+Content-Type: application/json
+
+{ "approverId": "{{mgr.response.body.data.id}}", "comment": "Release day, please move it" }
+
+### 21. Ravi cancels Asha's leave → 403
+POST {{base}}/leaves/{{leave.response.body.data.id}}/cancel
+Content-Type: application/json
+
+{ "employeeId": "{{ravi.response.body.data.id}}" }
+
+### 22. Asha cancels her approved (future) leave → 200 CANCELLED, used back to 0; history shows all 3 steps
+POST {{base}}/leaves/{{leave.response.body.data.id}}/cancel
+Content-Type: application/json
+
+{ "employeeId": "{{asha.response.body.data.id}}" }
+
+### 23. List with filters
+GET {{base}}/leaves?employeeId={{asha.response.body.data.id}}&status=CANCELLED

@@ -1,0 +1,89 @@
+# VS Code REST Client: click "Send Request" on each block, top to bottom.
+# Watch the server terminal too: handlers log each run, the scheduler logs retries.
+@base = http://localhost:3000
+
+### 1. Delayed one-off job -> 201 SCHEDULED; ~3s later COMPLETED (re-run request 2)
+# @name delayed
+POST {{base}}/jobs
+Content-Type: application/json
+
+{ "type": "SEND_EMAIL", "delayMs": 3000, "payload": { "to": "a@x.com" } }
+
+### 2. Fetch it with its run history
+GET {{base}}/jobs/{{delayed.response.body.data.id}}
+
+### 3. Recurring every 5s -> runs list grows on each fetch (request 4)
+# @name recurring
+POST {{base}}/jobs
+Content-Type: application/json
+
+{ "type": "SEND_EMAIL", "intervalMs": 5000, "payload": { "to": "digest@x.com" } }
+
+### 4. Watch the recurring job's runs
+GET {{base}}/jobs/{{recurring.response.body.data.id}}
+
+### 5. Cancel the recurring job -> 200 CANCELLED, no more runs (only works while SCHEDULED, not mid-run)
+POST {{base}}/jobs/{{recurring.response.body.data.id}}/cancel
+
+### 6. Cancel again -> 409
+POST {{base}}/jobs/{{recurring.response.body.data.id}}/cancel
+
+### 7. Always fails: attempts 1,2,3 with 1s, 2s backoff -> FAILED after ~3s (fetch with 8)
+# @name failing
+POST {{base}}/jobs
+Content-Type: application/json
+
+{ "type": "FAIL_ALWAYS", "maxAttempts": 3 }
+
+### 8. See 3 FAILED runs and lastError
+GET {{base}}/jobs/{{failing.response.body.data.id}}
+
+### 9. Random failures: usually succeeds after a retry or two
+POST {{base}}/jobs
+Content-Type: application/json
+
+{ "type": "FAIL_RANDOMLY", "payload": { "failRate": 0.7 }, "maxAttempts": 5 }
+
+### 10. Pool saturation: 3 slow reports + 1 high-priority email, pool size 2.
+# Send 10a, 10b, 10c, 10d quickly, then 11: 2 RUNNING, the rest wait. The email (priority 9)
+# starts before the third report as soon as a worker frees up.
+POST {{base}}/jobs
+Content-Type: application/json
+
+{ "type": "GENERATE_REPORT", "payload": { "durationMs": 4000 } }
+
+### 10b
+POST {{base}}/jobs
+Content-Type: application/json
+
+{ "type": "GENERATE_REPORT", "payload": { "durationMs": 4000 } }
+
+### 10c
+POST {{base}}/jobs
+Content-Type: application/json
+
+{ "type": "GENERATE_REPORT", "payload": { "durationMs": 4000 } }
+
+### 10d
+POST {{base}}/jobs
+Content-Type: application/json
+
+{ "type": "SEND_EMAIL", "priority": 9, "payload": { "to": "vip@x.com" } }
+
+### 11. Stats: jobs by status, busy workers, heap entries
+GET {{base}}/scheduler/stats
+
+### 12. Filter by status
+GET {{base}}/jobs?status=SCHEDULED
+
+### 13. Validation: runAt AND delayMs -> 400
+POST {{base}}/jobs
+Content-Type: application/json
+
+{ "type": "SEND_EMAIL", "runAt": "2099-01-01T00:00:00Z", "delayMs": 1000 }
+
+### 14. Unknown type -> 400 with knownTypes
+POST {{base}}/jobs
+Content-Type: application/json
+
+{ "type": "NOPE" }
